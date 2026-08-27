@@ -1,11 +1,8 @@
-# Document parsing & OCR
+# Document parsing & HTML processing
 pymupdf>=1.24.0
 pytesseract>=0.3.10
 pillow>=10.0.0
-
-# Paper fetching & APIs
-arxiv
-requests
+beautifulsoup4>=4.12.0
 
 # Embeddings & Vector Operations
 sentence-transformers>=3.0.0

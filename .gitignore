@@ -26,6 +26,8 @@ data/parsed/*
 data/bm25.pkl
 data/qdrant_storage/
 data/chroma_db/
+*.html
+*.htm
 *.sqlite3
 *.db
 

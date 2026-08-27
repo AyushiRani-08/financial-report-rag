@@ -7,6 +7,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 import chromadb
 from ingestion.pdf_parser import chunk_pdf
+from ingestion.html_parser import chunk_html
 from indexing.embedder import Embedder
 
 
@@ -30,16 +31,25 @@ class VectorStore:
         )
         self.embedder = Embedder()
 
-    def add_pdf(self, pdf_path: str):
-        """Chunks, embeds, and stores a PDF with its metadata."""
-        path_obj = Path(pdf_path)
+    def add_document(self, file_path: str) -> int:
+        """Chunks, embeds, and stores a PDF or HTML financial report with metadata.
+        Returns the number of stored chunks.
+        """
+        path_obj = Path(file_path)
         paper_id = path_obj.stem
+        ext = path_obj.suffix.lower()
 
-        print(f"1. Chunking {pdf_path}...")
-        chunks = chunk_pdf(pdf_path, chunk_size=500, overlap_pct=0.10)
+        print(f"1. Chunking {file_path} ({ext})...")
+        if ext in (".html", ".htm"):
+            chunks = chunk_html(file_path, chunk_size=500, overlap_pct=0.10)
+        elif ext == ".pdf":
+            chunks = chunk_pdf(file_path, chunk_size=500, overlap_pct=0.10)
+        else:
+            raise ValueError(f"Unsupported file format: '{ext}'. Supported formats: .pdf, .html, .htm")
+
         if not chunks:
             print("No chunks generated.")
-            return
+            return 0
 
         print("2. Generating embeddings...")
         embedded_chunks = self.embedder.embed_chunks(chunks)
@@ -53,6 +63,7 @@ class VectorStore:
                 "paper_id": paper_id,
                 "page_number": c["page_number"],
                 "word_count": c["word_count"],
+                "file_type": ext.lstrip("."),
             }
             for c in embedded_chunks
         ]
@@ -67,8 +78,13 @@ class VectorStore:
         print(
             f"✅ Successfully stored {len(embedded_chunks)} chunks for {paper_id}."
         )
+        return len(embedded_chunks)
+
+    def add_pdf(self, pdf_path: str) -> int:
+        """Backward compatibility alias for add_document."""
+        return self.add_document(pdf_path)
 
 
 if __name__ == "__main__":
     store = VectorStore()
-    store.add_pdf("data/raw_pdfs/1706.03762.pdf")
+    print("VectorStore initialized successfully.")
