@@ -1,15 +1,15 @@
-import os
+﻿import os
+import time
 from pathlib import Path
 import sys
 from typing import Any, Dict, List
 from dotenv import load_dotenv
 from groq import Groq
 
-
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from retrieval.retriever import Retriever
-
+from utils.logger import log_query, Timer
 
 load_dotenv()
 
@@ -18,7 +18,7 @@ class RAGGenerator:
 
   def __init__(
       self,
-      retriever: Retriever | None = None,
+      retriever=None,
       model_name: str = "openai/gpt-oss-20b"
   ):
     api_key = os.getenv("GROQ_API_KEY")
@@ -42,18 +42,30 @@ class RAGGenerator:
     return "\n\n".join(context_parts)
 
   def generate_answer(
-      self, query: str, top_k: int = 3, paper_id: str | None = None
+      self, query: str, top_k: int = 3, paper_id=None
   ) -> Dict[str, Any]:
     """Retrieves relevant chunks and generates a grounded response with page citations."""
-    chunks = self.retriever.retrieve(query=query, top_k=top_k, paper_id=paper_id)
+    total_start = time.perf_counter()
+
+    # --- Retrieval with timing ---
+    with Timer() as retrieval_timer:
+      chunks = self.retriever.retrieve(query=query, top_k=top_k, paper_id=paper_id)
 
     if not chunks:
+      log_query(
+          query=query, query_type="qa", paper_id=paper_id, top_k=top_k,
+          num_chunks_retrieved=0, similarity_scores=[],
+          retrieval_latency_ms=retrieval_timer.elapsed_ms,
+          llm_latency_ms=0, total_latency_ms=retrieval_timer.elapsed_ms,
+          model_name=self.model_name, answer_length=0,
+      )
       return {
           "answer": "No relevant financial documents found in the database matching your search.",
           "sources": [],
       }
 
     context = self.format_context(chunks)
+    similarity_scores = [c["similarity_score"] for c in chunks]
 
     system_prompt = (
         "You are an expert Senior Financial Analyst specialized in explaining corporate financial reports (10-K, 10-Q, quarterly earnings) to retail investors.\n"
@@ -72,36 +84,59 @@ RETAIL INVESTOR QUESTION:
 
 ANALYST RESPONSE:"""
 
-    response = self.client.chat.completions.create(
-        model=self.model_name,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.1,
+    # --- LLM call with timing ---
+    with Timer() as llm_timer:
+      response = self.client.chat.completions.create(
+          model=self.model_name,
+          messages=[
+              {"role": "system", "content": system_prompt},
+              {"role": "user", "content": user_prompt},
+          ],
+          temperature=0.1,
+      )
+
+    answer = response.choices[0].message.content
+    total_ms = (time.perf_counter() - total_start) * 1000
+
+    # --- Log the query ---
+    log_query(
+        query=query, query_type="qa", paper_id=paper_id, top_k=top_k,
+        num_chunks_retrieved=len(chunks), similarity_scores=similarity_scores,
+        retrieval_latency_ms=retrieval_timer.elapsed_ms,
+        llm_latency_ms=llm_timer.elapsed_ms,
+        total_latency_ms=total_ms,
+        model_name=self.model_name, answer_length=len(answer),
     )
 
-    return {
-        "answer": response.choices[0].message.content,
-        "sources": chunks,
-    }
+    return {"answer": answer, "sources": chunks}
 
-  def generate_standard_report(self, paper_id: str | None = None) -> Dict[str, Any]:
+  def generate_standard_report(self, paper_id=None) -> Dict[str, Any]:
     """Generates a comprehensive 5-part standard retail investor financial report."""
+    total_start = time.perf_counter()
+
     report_query = (
         "Provide a comprehensive financial summary including revenue growth, net income, "
         "profitability margins, free cash flow, major risk factors, and overall strategic guidance."
     )
-    # Fetch top 6 chunks for broad document coverage
-    chunks = self.retriever.retrieve(query=report_query, top_k=6, paper_id=paper_id)
+
+    with Timer() as retrieval_timer:
+      chunks = self.retriever.retrieve(query=report_query, top_k=6, paper_id=paper_id)
 
     if not chunks:
+      log_query(
+          query=report_query, query_type="standard_report", paper_id=paper_id, top_k=6,
+          num_chunks_retrieved=0, similarity_scores=[],
+          retrieval_latency_ms=retrieval_timer.elapsed_ms,
+          llm_latency_ms=0, total_latency_ms=retrieval_timer.elapsed_ms,
+          model_name=self.model_name, answer_length=0,
+      )
       return {
           "answer": "No financial documents found to generate a report. Please upload a PDF or HTML report first.",
           "sources": [],
       }
 
     context = self.format_context(chunks)
+    similarity_scores = [c["similarity_score"] for c in chunks]
 
     system_prompt = (
         "You are a Senior Retail Financial Analyst.\n"
@@ -120,19 +155,29 @@ ANALYST RESPONSE:"""
 
 Generate the Standard Financial Analysis Report now."""
 
-    response = self.client.chat.completions.create(
-        model=self.model_name,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.2,
+    with Timer() as llm_timer:
+      response = self.client.chat.completions.create(
+          model=self.model_name,
+          messages=[
+              {"role": "system", "content": system_prompt},
+              {"role": "user", "content": user_prompt},
+          ],
+          temperature=0.2,
+      )
+
+    answer = response.choices[0].message.content
+    total_ms = (time.perf_counter() - total_start) * 1000
+
+    log_query(
+        query=report_query, query_type="standard_report", paper_id=paper_id, top_k=6,
+        num_chunks_retrieved=len(chunks), similarity_scores=similarity_scores,
+        retrieval_latency_ms=retrieval_timer.elapsed_ms,
+        llm_latency_ms=llm_timer.elapsed_ms,
+        total_latency_ms=total_ms,
+        model_name=self.model_name, answer_length=len(answer),
     )
 
-    return {
-        "answer": response.choices[0].message.content,
-        "sources": chunks,
-    }
+    return {"answer": answer, "sources": chunks}
 
 
 if __name__ == "__main__":

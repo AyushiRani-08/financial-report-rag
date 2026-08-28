@@ -47,3 +47,7 @@ Thumbs.db
 # Deployment Platforms
 .railway/
 .fly/
+# Logs
+logs/
+*.log
+*.jsonl
