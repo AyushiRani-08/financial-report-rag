@@ -1,14 +1,15 @@
-﻿import os
+import os
 import time
 from pathlib import Path
 import sys
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 from groq import Groq
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from retrieval.retriever import Retriever
+from retrieval.xbrl_retriever import XBRLRetriever
 from utils.logger import log_query, Timer
 
 load_dotenv()
@@ -19,7 +20,8 @@ class RAGGenerator:
   def __init__(
       self,
       retriever=None,
-      model_name: str = "openai/gpt-oss-20b"
+      model_name: str = "openai/gpt-oss-20b",
+      xbrl_retriever: Optional[XBRLRetriever] = None,
   ):
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
@@ -28,6 +30,18 @@ class RAGGenerator:
     self.retriever = retriever or Retriever()
     self.model_name = model_name
     self.client = Groq(api_key=api_key)
+
+    # Optional: structured XBRL retriever backed by PostgreSQL.
+    # Auto-initializes if POSTGRES_DSN is set; silently disabled otherwise.
+    if xbrl_retriever is not None:
+      self.xbrl_retriever: Optional[XBRLRetriever] = xbrl_retriever
+    elif os.getenv("POSTGRES_DSN"):
+      try:
+        self.xbrl_retriever = XBRLRetriever()
+      except Exception:
+        self.xbrl_retriever = None
+    else:
+      self.xbrl_retriever = None
 
   def format_context(self, retrieved_chunks: List[Dict[str, Any]]) -> str:
     """Formats retrieved chunks with citations into a unified context block."""
@@ -41,8 +55,20 @@ class RAGGenerator:
       )
     return "\n\n".join(context_parts)
 
+  def _get_xbrl_context(self, ticker: Optional[str], fiscal_period: Optional[str] = None) -> str:
+    """Fetch structured XBRL facts from PostgreSQL as a formatted text block.
+    Returns empty string if XBRL retriever is unavailable or ticker is None.
+    """
+    if not self.xbrl_retriever or not ticker:
+      return ""
+    try:
+      return self.xbrl_retriever.to_context_string(ticker=ticker, fiscal_period=fiscal_period)
+    except Exception:
+      return ""
+
   def generate_answer(
-      self, query: str, top_k: int = 3, paper_id=None
+      self, query: str, top_k: int = 3, paper_id=None,
+      ticker: Optional[str] = None, fiscal_period: Optional[str] = None,
   ) -> Dict[str, Any]:
     """Retrieves relevant chunks and generates a grounded response with page citations."""
     total_start = time.perf_counter()
@@ -67,16 +93,21 @@ class RAGGenerator:
     context = self.format_context(chunks)
     similarity_scores = [c["similarity_score"] for c in chunks]
 
+    # --- Structured XBRL facts from PostgreSQL (prepended for grounding) ---
+    xbrl_block = self._get_xbrl_context(ticker=ticker, fiscal_period=fiscal_period)
+    xbrl_section = f"{xbrl_block}\n\n" if xbrl_block else ""
+
     system_prompt = (
         "You are an expert Senior Financial Analyst specialized in explaining corporate financial reports (10-K, 10-Q, quarterly earnings) to retail investors.\n"
         "Rules:\n"
         "1. Answer clearly, accurately, and concisely using ONLY the provided CONTEXT.\n"
-        "2. Explain complex financial jargon (e.g. EBITDA, Free Cash Flow, Diluted EPS) in accessible terms for retail investors when relevant.\n"
-        "3. If the context does not contain the answer, state: 'I cannot find sufficient information in the indexed financial report.'\n"
-        "4. Always cite specific page or section numbers using [Page X] notation whenever citing metrics or statements."
+        "2. If STRUCTURED FINANCIAL DATA is provided at the top, treat those figures as ground truth — they come directly from official XBRL filings.\n"
+        "3. Explain complex financial jargon (e.g. EBITDA, Free Cash Flow, Diluted EPS) in accessible terms for retail investors when relevant.\n"
+        "4. If the context does not contain the answer, state: 'I cannot find sufficient information in the indexed financial report.'\n"
+        "5. Always cite specific page or section numbers using [Page X] notation whenever citing metrics or statements."
     )
 
-    user_prompt = f"""CONTEXT FROM FINANCIAL REPORT:
+    user_prompt = f"""{xbrl_section}CONTEXT FROM FINANCIAL REPORT:
 {context}
 
 RETAIL INVESTOR QUESTION:
@@ -110,7 +141,10 @@ ANALYST RESPONSE:"""
 
     return {"answer": answer, "sources": chunks}
 
-  def generate_standard_report(self, paper_id=None) -> Dict[str, Any]:
+  def generate_standard_report(
+      self, paper_id=None,
+      ticker: Optional[str] = None, fiscal_period: Optional[str] = None,
+  ) -> Dict[str, Any]:
     """Generates a comprehensive 5-part standard retail investor financial report."""
     total_start = time.perf_counter()
 
@@ -138,6 +172,10 @@ ANALYST RESPONSE:"""
     context = self.format_context(chunks)
     similarity_scores = [c["similarity_score"] for c in chunks]
 
+    # --- Structured XBRL facts from PostgreSQL (prepended for grounding) ---
+    xbrl_block = self._get_xbrl_context(ticker=ticker, fiscal_period=fiscal_period)
+    xbrl_section = f"{xbrl_block}\n\n" if xbrl_block else ""
+
     system_prompt = (
         "You are a Senior Retail Financial Analyst.\n"
         "Generate a structured, professional Standard Financial Analysis Report formatted in clean Markdown.\n"
@@ -147,10 +185,11 @@ ANALYST RESPONSE:"""
         "### 3. Balance Sheet & Cash Flow Health\n"
         "### 4. Key Risk Factors & Market Headwinds\n"
         "### 5. Retail Investor Takeaway\n\n"
-        "Base all statements strictly on the provided CONTEXT and cite pages/sections as [Page X]."
+        "If STRUCTURED FINANCIAL DATA is provided at the top, use those exact figures in sections 2 and 3 — they are verified XBRL values from official filings.\n"
+        "Base all other statements strictly on the provided CONTEXT and cite pages/sections as [Page X]."
     )
 
-    user_prompt = f"""CONTEXT FROM FINANCIAL FILING:
+    user_prompt = f"""{xbrl_section}CONTEXT FROM FINANCIAL FILING:
 {context}
 
 Generate the Standard Financial Analysis Report now."""

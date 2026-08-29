@@ -3,6 +3,7 @@ venv/
 .venv/
 env/
 ENV/
+env_new/
 .Python
 
 # Byte-code / Cache
@@ -35,7 +36,9 @@ data/chroma_db/
 .streamlit/*.sqlite3
 
 # Logs & Docker
+logs/
 *.log
+*.jsonl
 docker-compose.override.yml
 
 # IDE & OS Metadata
@@ -47,7 +50,3 @@ Thumbs.db
 # Deployment Platforms
 .railway/
 .fly/
-# Logs
-logs/
-*.log
-*.jsonl
