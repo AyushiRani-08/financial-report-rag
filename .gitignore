@@ -24,6 +24,8 @@ data/raw_pdfs/*
 !data/raw_pdfs/.gitkeep
 data/parsed/*
 !data/parsed/.gitkeep
+data/xbrl/*
+!data/xbrl/.gitkeep
 data/bm25.pkl
 data/qdrant_storage/
 data/chroma_db/

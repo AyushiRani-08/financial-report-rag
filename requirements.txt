@@ -9,8 +9,8 @@ sentence-transformers>=3.0.0
 chromadb>=0.5.0
 
 
-# XBRL parsing (python-xbrl works on Python 3.13; arelle-release requires <3.13)
-python-xbrl==1.1.1          # lightweight SEC XBRL parser
+# XBRL parsing — uses lxml directly (python-xbrl incompatible with marshmallow 4.x on Python 3.13)
+# lxml is pulled in automatically as a transitive dependency (beautifulsoup4, chromadb)
 
 # PostgreSQL
 psycopg2-binary>=2.9.0      # PostgreSQL adapter

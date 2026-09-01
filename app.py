@@ -2,208 +2,566 @@
 from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
+import os
 
 from generation.generator import RAGGenerator
 from indexing.vector_store import VectorStore
 
 load_dotenv()
 
-# Page configuration
 st.set_page_config(
-    page_title="Financial Report RAG Assistant",
-    page_icon="📊",
+    page_title="FinSight — Financial Intelligence Platform",
+    page_icon="📈",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# Custom Styling
-st.markdown(
-    """
-    <style>
-    .main-header { font-size: 2.2rem; font-weight: 700; margin-bottom: 0.5rem; color: #1E293B; }
-    .sub-text { font-size: 1.05rem; color: #64748B; margin-bottom: 1.5rem; }
-    .citation-badge { background-color: #F1F5F9; padding: 2px 8px; border-radius: 4px; font-size: 0.85rem; font-weight: 600; }
-    </style>
-""",
-    unsafe_allow_html=True,
-)
+# ─────────────────────────────────────────────
+# PREMIUM DARK UI STYLES
+# ─────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+
+/* ── Base ── */
+html, body, [class*="css"] {
+    font-family: 'Inter', sans-serif;
+}
+.stApp {
+    background: linear-gradient(135deg, #0a0e1a 0%, #0d1321 50%, #0a1628 100%);
+    color: #e2e8f0;
+}
+
+/* ── Sidebar ── */
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #0d1521 0%, #0a1120 100%);
+    border-right: 1px solid rgba(99, 179, 237, 0.12);
+}
+[data-testid="stSidebar"] .stMarkdown p {
+    color: #94a3b8;
+    font-size: 0.82rem;
+}
+
+/* ── Sidebar Inputs ── */
+[data-testid="stSidebar"] .stTextInput input,
+[data-testid="stSidebar"] .stSelectbox select {
+    background: rgba(255,255,255,0.04) !important;
+    border: 1px solid rgba(99,179,237,0.2) !important;
+    border-radius: 8px !important;
+    color: #e2e8f0 !important;
+    font-family: 'Inter', sans-serif !important;
+}
+[data-testid="stSidebar"] .stTextInput input:focus {
+    border-color: rgba(99,179,237,0.6) !important;
+    box-shadow: 0 0 0 2px rgba(99,179,237,0.15) !important;
+}
+
+/* ── File Uploader ── */
+[data-testid="stFileUploader"] {
+    background: rgba(255,255,255,0.03) !important;
+    border: 1.5px dashed rgba(99,179,237,0.25) !important;
+    border-radius: 12px !important;
+    transition: border-color 0.2s ease;
+}
+[data-testid="stFileUploader"]:hover {
+    border-color: rgba(99,179,237,0.5) !important;
+}
+
+/* ── Buttons ── */
+.stButton > button {
+    background: linear-gradient(135deg, #1d4ed8, #2563eb) !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 10px !important;
+    font-family: 'Inter', sans-serif !important;
+    font-weight: 600 !important;
+    font-size: 0.85rem !important;
+    padding: 0.55rem 1rem !important;
+    transition: all 0.2s ease !important;
+    box-shadow: 0 4px 15px rgba(37,99,235,0.3) !important;
+}
+.stButton > button:hover {
+    transform: translateY(-1px) !important;
+    box-shadow: 0 6px 20px rgba(37,99,235,0.45) !important;
+    background: linear-gradient(135deg, #2563eb, #3b82f6) !important;
+}
+.stButton > button:active {
+    transform: translateY(0) !important;
+}
+
+/* ── Chat Messages ── */
+[data-testid="stChatMessage"] {
+    background: rgba(255,255,255,0.03) !important;
+    border: 1px solid rgba(255,255,255,0.07) !important;
+    border-radius: 16px !important;
+    backdrop-filter: blur(10px) !important;
+    margin-bottom: 0.75rem !important;
+    padding: 1rem 1.25rem !important;
+}
+
+/* ── Chat Input ── */
+[data-testid="stChatInput"] {
+    background: rgba(255,255,255,0.05) !important;
+    border: 1px solid rgba(99,179,237,0.25) !important;
+    border-radius: 14px !important;
+    color: #e2e8f0 !important;
+}
+[data-testid="stChatInput"]:focus-within {
+    border-color: rgba(99,179,237,0.55) !important;
+    box-shadow: 0 0 0 3px rgba(99,179,237,0.1) !important;
+}
+
+/* ── Metrics ── */
+[data-testid="stMetric"] {
+    background: rgba(255,255,255,0.04) !important;
+    border: 1px solid rgba(255,255,255,0.08) !important;
+    border-radius: 12px !important;
+    padding: 0.85rem !important;
+}
+[data-testid="stMetricValue"] {
+    color: #63b3ed !important;
+    font-weight: 700 !important;
+}
+
+/* ── Expander ── */
+[data-testid="stExpander"] {
+    background: rgba(255,255,255,0.02) !important;
+    border: 1px solid rgba(255,255,255,0.07) !important;
+    border-radius: 12px !important;
+}
+
+/* ── Selectbox ── */
+[data-testid="stSelectbox"] > div > div {
+    background: rgba(255,255,255,0.04) !important;
+    border: 1px solid rgba(99,179,237,0.2) !important;
+    border-radius: 8px !important;
+    color: #e2e8f0 !important;
+}
+
+/* ── Slider ── */
+[data-testid="stSlider"] [role="slider"] {
+    background: #3b82f6 !important;
+}
+
+/* ── Alerts / Info / Success ── */
+.stSuccess {
+    background: rgba(16,185,129,0.1) !important;
+    border: 1px solid rgba(16,185,129,0.3) !important;
+    border-radius: 10px !important;
+    color: #6ee7b7 !important;
+}
+.stInfo {
+    background: rgba(99,179,237,0.08) !important;
+    border: 1px solid rgba(99,179,237,0.2) !important;
+    border-radius: 10px !important;
+    color: #93c5fd !important;
+}
+.stError {
+    background: rgba(239,68,68,0.1) !important;
+    border: 1px solid rgba(239,68,68,0.3) !important;
+    border-radius: 10px !important;
+}
+.stWarning {
+    background: rgba(245,158,11,0.1) !important;
+    border: 1px solid rgba(245,158,11,0.3) !important;
+    border-radius: 10px !important;
+}
+
+/* ── Divider ── */
+hr {
+    border-color: rgba(255,255,255,0.08) !important;
+}
+
+/* ── Header ── */
+.finsight-header {
+    background: linear-gradient(135deg, rgba(37,99,235,0.15), rgba(99,179,237,0.08));
+    border: 1px solid rgba(99,179,237,0.2);
+    border-radius: 20px;
+    padding: 2rem 2.5rem;
+    margin-bottom: 1.5rem;
+    backdrop-filter: blur(10px);
+}
+.finsight-title {
+    font-size: 2.4rem;
+    font-weight: 800;
+    background: linear-gradient(135deg, #63b3ed, #818cf8, #a78bfa);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    margin: 0 0 0.4rem 0;
+    letter-spacing: -0.5px;
+}
+.finsight-subtitle {
+    font-size: 1rem;
+    color: #94a3b8;
+    margin: 0;
+    font-weight: 400;
+}
+
+/* ── Status pill ── */
+.pill {
+    display: inline-block;
+    padding: 0.2rem 0.7rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    font-family: 'JetBrains Mono', monospace;
+    letter-spacing: 0.03em;
+}
+.pill-blue  { background: rgba(99,179,237,0.15); color: #63b3ed; border: 1px solid rgba(99,179,237,0.3); }
+.pill-green { background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }
+.pill-amber { background: rgba(245,158,11,0.15); color: #fbbf24; border: 1px solid rgba(245,158,11,0.3); }
+
+/* ── Section label ── */
+.section-label {
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: #64748b;
+    margin-bottom: 0.5rem;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(99,179,237,0.2); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(99,179,237,0.4); }
+
+/* ── Spinner ── */
+.stSpinner > div { border-top-color: #3b82f6 !important; }
+</style>
+""", unsafe_allow_html=True)
 
 
+# ─────────────────────────────────────────────
+# COMPONENT INIT
+# ─────────────────────────────────────────────
 @st.cache_resource
 def get_components():
-  """Loads vector store and generator once and caches them in memory."""
-  store = VectorStore(persist_directory="data/chroma_db")
-  generator = RAGGenerator(retriever=None, model_name="openai/gpt-oss-20b")
-  return store, generator
-
+    store = VectorStore(persist_directory="data/chroma_db")
+    generator = RAGGenerator(retriever=None, model_name="openai/gpt-oss-20b")
+    return store, generator
 
 vector_store, rag_generator = get_components()
 
-# Self-healing check: automatically clear cache if an outdated cached instance is detected
 if not hasattr(vector_store, "add_document") or not hasattr(rag_generator, "generate_standard_report"):
-  st.cache_resource.clear()
-  st.rerun()
+    st.cache_resource.clear()
+    st.rerun()
 
 @st.cache_data(ttl=60)
 def get_indexed_documents(_collection):
-  """Fetch indexed document list cached for 60 seconds to avoid disk reads on every rerun."""
-  try:
-    metas = _collection.get(include=["metadatas"])["metadatas"]
-    docs = sorted(list({m["paper_id"] for m in metas if m and "paper_id" in m}))
-    return docs
-  except Exception:
-    return []
+    try:
+        metas = _collection.get(include=["metadatas"])["metadatas"]
+        return sorted(list({m["paper_id"] for m in metas if m and "paper_id" in m}))
+    except Exception:
+        return []
 
 
-# --- SIDEBAR: Financial Report Management ---
+# ─────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────
 with st.sidebar:
-  st.title("📊 Report Indexer")
-  st.write("Upload PDF or HTML financial filings (10-K, 10-Q, Annual Reports).")
+    st.markdown("""
+    <div style="padding: 0.5rem 0 1rem 0;">
+        <div style="font-size:1.3rem; font-weight:800; color:#63b3ed; letter-spacing:-0.3px;">
+            📈 FinSight
+        </div>
+        <div style="font-size:0.75rem; color:#475569; margin-top:2px;">Financial Intelligence Platform</div>
+    </div>
+    """, unsafe_allow_html=True)
 
-  uploaded_file = st.file_uploader(
-      "Upload Document (.pdf, .html, .htm)",
-      type=["pdf", "html", "htm"],
-      key="doc_uploader",
-  )
-  if uploaded_file and st.button("Index Financial Report", use_container_width=True):
-    raw_dir = Path("data/raw_pdfs")
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    # ── Section 1: Document Ingestion ──
+    st.markdown('<div class="section-label">📄 Document Ingestion</div>', unsafe_allow_html=True)
 
-    # Sanitize filename (removes spaces, parentheses, special characters)
-    clean_name = "".join(
-        c for c in uploaded_file.name if c.isalnum() or c in (".", "_", "-")
-    )
-    save_path = raw_dir / clean_name
-
-    with open(save_path, "wb") as f:
-      f.write(uploaded_file.getbuffer())
-
-    with st.spinner(f"Parsing, chunking, and embedding '{clean_name}'..."):
-      try:
-        added_count = vector_store.add_document(str(save_path))
-        st.cache_data.clear()  # Invalidate document list cache
-        st.success(
-            f"✅ Successfully indexed `{clean_name}` ({added_count} chunks added)!"
+    with st.expander("Upload Filing (PDF / HTML)", expanded=True):
+        st.caption("SEC 10-K, 10-Q, Annual Reports, HTML filings")
+        uploaded_doc = st.file_uploader(
+            "Drop PDF or HTML here",
+            type=["pdf", "html", "htm"],
+            key="doc_uploader",
+            label_visibility="collapsed",
         )
-        st.rerun()
-      except Exception as e:
-        st.error(f"❌ Indexing Failed: {e}")
-        st.exception(e)
+        if uploaded_doc and st.button("⬆ Index Document", use_container_width=True, key="btn_index_doc"):
+            raw_dir = Path("data/raw_pdfs")
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            clean_name = "".join(c for c in uploaded_doc.name if c.isalnum() or c in (".", "_", "-"))
+            save_path = raw_dir / clean_name
+            with open(save_path, "wb") as f:
+                f.write(uploaded_doc.getbuffer())
+            with st.spinner(f"Parsing & embedding `{clean_name}`..."):
+                try:
+                    count = vector_store.add_document(str(save_path))
+                    st.cache_data.clear()
+                    st.success(f"Indexed **{count}** chunks from `{clean_name}`")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Indexing failed: {e}")
 
-  st.divider()
+    with st.expander("Upload XBRL (.xml) for Exact Numbers", expanded=False):
+        st.caption("Links verified SEC financial figures to PostgreSQL")
+        uploaded_xbrl = st.file_uploader(
+            "Drop XBRL XML here",
+            type=["xml"],
+            key="xbrl_uploader",
+            label_visibility="collapsed",
+        )
+        xbrl_ticker_input = st.text_input(
+            "Ticker", placeholder="AAPL", key="xbrl_ticker_input"
+        ).strip().upper()
+        xbrl_name_input = st.text_input(
+            "Company Name", placeholder="Apple Inc.", key="xbrl_name_input"
+        ).strip()
+        xbrl_form_input = st.selectbox(
+            "Form Type", ["10-K", "10-Q", "AOC-4", "Annual Report"], key="xbrl_form"
+        )
+        xbrl_period_input = st.text_input(
+            "Fiscal Period", placeholder="FY2024", key="xbrl_period_input"
+        ).strip()
+        xbrl_market_input = st.selectbox("Market", ["US", "IN"], key="xbrl_market")
 
-  # Collection Stats
-  total_chunks = vector_store.collection.count()
-  st.metric(label="Total Chunks in Vector DB", value=total_chunks)
+        can_ingest_xbrl = (
+            uploaded_xbrl and xbrl_ticker_input and xbrl_name_input and xbrl_period_input
+        )
+        if st.button(
+            "⚡ Ingest XBRL into Database",
+            use_container_width=True,
+            key="btn_ingest_xbrl",
+            disabled=not can_ingest_xbrl,
+        ):
+            xbrl_dir = Path("data/xbrl")
+            xbrl_dir.mkdir(parents=True, exist_ok=True)
+            xbrl_path = xbrl_dir / uploaded_xbrl.name
+            with open(xbrl_path, "wb") as f:
+                f.write(uploaded_xbrl.getbuffer())
+            with st.spinner(f"Parsing XBRL for **{xbrl_ticker_input}**..."):
+                try:
+                    from ingestion.xbrl_parser import parse_xbrl_to_db
+                    count = parse_xbrl_to_db(
+                        xbrl_path=str(xbrl_path),
+                        ticker=xbrl_ticker_input,
+                        company_name=xbrl_name_input,
+                        form_type=xbrl_form_input,
+                        fiscal_period=xbrl_period_input,
+                        market=xbrl_market_input,
+                    )
+                    st.success(f"Inserted **{count}** facts for `{xbrl_ticker_input}` into PostgreSQL")
+                except Exception as e:
+                    st.error(f"XBRL ingestion failed: {e}")
+                    st.exception(e)
 
-  # Cached Document List
-  available_docs = get_indexed_documents(vector_store.collection)
+    st.divider()
 
-  selected_doc = st.selectbox(
-      "Filter by Document ID",
-      options=["All Documents"] + available_docs,
-      help="Filter search to a specific financial report",
-  )
-  target_paper = None if selected_doc == "All Documents" else selected_doc
+    # ── Section 2: Query Controls ──
+    st.markdown('<div class="section-label">🔍 Query Controls</div>', unsafe_allow_html=True)
 
-  # Top-K Slider
-  top_k = st.slider("Context Chunks (Top-K)", min_value=1, max_value=8, value=4)
+    available_docs = get_indexed_documents(vector_store.collection)
+    total_chunks = vector_store.collection.count()
 
-# --- MAIN CHAT INTERFACE ---
-st.markdown(
-    '<div class="main-header">📊 Financial Report RAG Assistant for Retail Investors</div>',
-    unsafe_allow_html=True,
-)
-st.markdown(
-    '<div class="sub-text">Analyze corporate filings, quarterly earnings, and annual reports. Ask custom questions or generate standardized retail investor reports.</div>',
-    unsafe_allow_html=True,
-)
+    col_m1, col_m2 = st.columns(2)
+    with col_m1:
+        st.metric("Chunks", total_chunks)
+    with col_m2:
+        st.metric("Docs", len(available_docs))
 
-# Standard Report Generation Quick Action
-col1, col2 = st.columns([3, 1])
-with col1:
-  st.caption(f"Currently filtering: **{selected_doc}**")
-with col2:
-  generate_report_btn = st.button("⚡ Generate Standard Financial Report", use_container_width=True)
+    selected_doc = st.selectbox(
+        "Filter Document",
+        options=["All Documents"] + available_docs,
+        key="doc_filter",
+    )
+    target_paper = None if selected_doc == "All Documents" else selected_doc
+    top_k = st.slider("Context Chunks (Top-K)", min_value=1, max_value=8, value=4)
 
-# Chat session state initialization
+    st.divider()
+
+    # ── Section 3: XBRL Grounding ──
+    st.markdown('<div class="section-label">🗄️ XBRL Grounding</div>', unsafe_allow_html=True)
+    st.caption("Link a ticker to inject verified numbers into every answer.")
+
+    xbrl_ticker = st.text_input(
+        "Active Ticker", placeholder="e.g. AAPL", key="active_ticker"
+    ).strip().upper() or None
+
+    xbrl_period = st.text_input(
+        "Active Period", placeholder="e.g. FY2024", key="active_period"
+    ).strip() or None
+
+    if xbrl_ticker:
+        st.markdown(
+            f'<span class="pill pill-green">● XBRL ON</span>&nbsp;'
+            f'<span class="pill pill-blue">{xbrl_ticker}</span>&nbsp;'
+            f'<span class="pill pill-amber">{xbrl_period or "latest"}</span>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<span class="pill pill-amber">○ XBRL OFF</span>&emsp;'
+            '<span style="color:#475569;font-size:0.75rem;">Set ticker to activate</span>',
+            unsafe_allow_html=True,
+        )
+
+
+# ─────────────────────────────────────────────
+# MAIN HEADER
+# ─────────────────────────────────────────────
+st.markdown("""
+<div class="finsight-header">
+    <div style="display:flex; align-items:center; gap:0.75rem;">
+        <div>
+            <p class="finsight-title">📈 FinSight</p>
+            <p class="finsight-subtitle">
+                AI-powered financial intelligence for retail investors &mdash;
+                combining SEC filings, XBRL structured data, and advanced RAG.
+            </p>
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+# ── Action Row ──
+col_label, col_btn = st.columns([4, 1])
+with col_label:
+    active_doc_label = f"📂 `{selected_doc}`"
+    if xbrl_ticker:
+        active_doc_label += f" &nbsp;·&nbsp; " \
+            f'<span class="pill pill-green">{xbrl_ticker}</span> ' \
+            f'<span class="pill pill-blue">{xbrl_period or "latest"}</span>'
+    st.markdown(
+        f'<div style="color:#64748b; font-size:0.85rem; padding-top:0.6rem;">'
+        f'Filtering: {active_doc_label}</div>',
+        unsafe_allow_html=True,
+    )
+with col_btn:
+    generate_report_btn = st.button(
+        "⚡ Standard Report", use_container_width=True, key="btn_report"
+    )
+
+st.divider()
+
+# ─────────────────────────────────────────────
+# CHAT STATE
+# ─────────────────────────────────────────────
 if "messages" not in st.session_state:
-  st.session_state.messages = []
+    st.session_state.messages = []
 
-# Display conversation history
+# Welcome state
+if not st.session_state.messages:
+    st.markdown("""
+    <div style="
+        text-align:center;
+        padding: 3rem 1rem;
+        color: #475569;
+    ">
+        <div style="font-size:3rem; margin-bottom:1rem;">💬</div>
+        <div style="font-size:1.1rem; font-weight:600; color:#64748b; margin-bottom:0.5rem;">
+            Start your financial analysis
+        </div>
+        <div style="font-size:0.85rem; color:#475569;">
+            Upload a filing in the sidebar, then ask questions or generate a standard report.
+        </div>
+        <div style="margin-top:1.5rem; display:flex; justify-content:center; gap:0.75rem; flex-wrap:wrap;">
+            <span class="pill pill-blue">What was revenue growth?</span>
+            <span class="pill pill-blue">Summarize key risk factors</span>
+            <span class="pill pill-blue">Analyze cash flow health</span>
+            <span class="pill pill-blue">What is the debt-to-equity ratio?</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ── Render chat history ──
 for msg in st.session_state.messages:
-  with st.chat_message(msg["role"]):
-    st.markdown(msg["content"])
-    if "sources" in msg and msg["sources"]:
-      with st.expander("🔍 View Retrieved Financial Sources"):
-        for i, src in enumerate(msg["sources"], start=1):
-          meta = src["metadata"]
-          st.markdown(
-              f"**Source {i}:** Document `{meta.get('paper_id')}` | Page/Section"
-              f" `{meta.get('page_number')}` | Similarity Score:"
-              f" `{src.get('similarity_score')}`"
-          )
-          st.caption(src["text"])
-          st.divider()
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if "sources" in msg and msg["sources"]:
+            with st.expander(f"🔍 View {len(msg['sources'])} retrieved source(s)"):
+                for i, src in enumerate(msg["sources"], start=1):
+                    meta = src["metadata"]
+                    st.markdown(
+                        f'<span class="pill pill-blue">Source {i}</span> &nbsp;'
+                        f'`{meta.get("paper_id")}` &nbsp;·&nbsp; '
+                        f'Page `{meta.get("page_number")}` &nbsp;·&nbsp; '
+                        f'Score `{src.get("similarity_score")}`',
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(src["text"])
+                    if i < len(msg["sources"]):
+                        st.divider()
 
-# Action: Generate Standard Report
+
+# ─────────────────────────────────────────────
+# GENERATE STANDARD REPORT
+# ─────────────────────────────────────────────
 if generate_report_btn:
-  with st.chat_message("user"):
-    st.markdown(f"⚡ Generate Standard Financial Analysis Report for `{selected_doc}`")
-  st.session_state.messages.append(
-      {"role": "user", "content": f"⚡ Generate Standard Financial Analysis Report for `{selected_doc}`"}
-  )
+    user_msg = f"⚡ Generate Standard Financial Analysis Report for `{selected_doc}`"
+    with st.chat_message("user"):
+        st.markdown(user_msg)
+    st.session_state.messages.append({"role": "user", "content": user_msg})
 
-  with st.chat_message("assistant"):
-    with st.spinner("Analyzing financial filing and synthesizing retail investor report..."):
-      report_data = rag_generator.generate_standard_report(paper_id=target_paper)
-      st.markdown(report_data["answer"])
-
-      if report_data["sources"]:
-        with st.expander("🔍 View Retrieved Financial Sources"):
-          for i, src in enumerate(report_data["sources"], start=1):
-            meta = src["metadata"]
-            st.markdown(
-                f"**Source {i}:** Document `{meta.get('paper_id')}` | Page/Section"
-                f" `{meta.get('page_number')}` | Similarity Score:"
-                f" `{src.get('similarity_score')}`"
+    with st.chat_message("assistant"):
+        with st.spinner("Synthesizing retail investor report..."):
+            report_data = rag_generator.generate_standard_report(
+                paper_id=target_paper,
+                ticker=xbrl_ticker,
+                fiscal_period=xbrl_period,
             )
-            st.caption(src["text"])
-            st.divider()
+            st.markdown(report_data["answer"])
+            if report_data["sources"]:
+                with st.expander(f"🔍 View {len(report_data['sources'])} retrieved source(s)"):
+                    for i, src in enumerate(report_data["sources"], start=1):
+                        meta = src["metadata"]
+                        st.markdown(
+                            f'<span class="pill pill-blue">Source {i}</span> &nbsp;'
+                            f'`{meta.get("paper_id")}` &nbsp;·&nbsp; '
+                            f'Page `{meta.get("page_number")}` &nbsp;·&nbsp; '
+                            f'Score `{src.get("similarity_score")}`',
+                            unsafe_allow_html=True,
+                        )
+                        st.caption(src["text"])
+                        if i < len(report_data["sources"]):
+                            st.divider()
 
-  st.session_state.messages.append({
-      "role": "assistant",
-      "content": report_data["answer"],
-      "sources": report_data["sources"],
-  })
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": report_data["answer"],
+        "sources": report_data["sources"],
+    })
 
-# Action: Custom Q&A Prompt
-if prompt := st.chat_input("Ask a question about revenue, debt, risks, margins..."):
-  st.session_state.messages.append({"role": "user", "content": prompt})
-  with st.chat_message("user"):
-    st.markdown(prompt)
 
-  with st.chat_message("assistant"):
-    with st.spinner("Retrieving financial context and generating analyst response..."):
-      response_data = rag_generator.generate_answer(
-          query=prompt, top_k=top_k, paper_id=target_paper
-      )
+# ─────────────────────────────────────────────
+# CUSTOM Q&A CHAT INPUT
+# ─────────────────────────────────────────────
+if prompt := st.chat_input("Ask about revenue, debt, risks, margins, EPS..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-      st.markdown(response_data["answer"])
-
-      if response_data["sources"]:
-        with st.expander("🔍 View Retrieved Financial Sources"):
-          for i, src in enumerate(response_data["sources"], start=1):
-            meta = src["metadata"]
-            st.markdown(
-                f"**Source {i}:** Document `{meta.get('paper_id')}` | Page/Section"
-                f" `{meta.get('page_number')}` | Similarity Score:"
-                f" `{src.get('similarity_score')}`"
+    with st.chat_message("assistant"):
+        with st.spinner("Retrieving context and generating analyst response..."):
+            response_data = rag_generator.generate_answer(
+                query=prompt,
+                top_k=top_k,
+                paper_id=target_paper,
+                ticker=xbrl_ticker,
+                fiscal_period=xbrl_period,
             )
-            st.caption(src["text"])
-            st.divider()
+            st.markdown(response_data["answer"])
+            if response_data["sources"]:
+                with st.expander(f"🔍 View {len(response_data['sources'])} retrieved source(s)"):
+                    for i, src in enumerate(response_data["sources"], start=1):
+                        meta = src["metadata"]
+                        st.markdown(
+                            f'<span class="pill pill-blue">Source {i}</span> &nbsp;'
+                            f'`{meta.get("paper_id")}` &nbsp;·&nbsp; '
+                            f'Page `{meta.get("page_number")}` &nbsp;·&nbsp; '
+                            f'Score `{src.get("similarity_score")}`',
+                            unsafe_allow_html=True,
+                        )
+                        st.caption(src["text"])
+                        if i < len(response_data["sources"]):
+                            st.divider()
 
-  st.session_state.messages.append({
-      "role": "assistant",
-      "content": response_data["answer"],
-      "sources": response_data["sources"],
-  })
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": response_data["answer"],
+        "sources": response_data["sources"],
+    })
