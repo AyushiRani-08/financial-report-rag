@@ -23,153 +23,122 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
 
-/* ── Base ── */
-html, body, [class*="css"] {
+/* ── Global resets & typography ── */
+* {
     font-family: 'Inter', sans-serif;
 }
 .stApp {
-    background: linear-gradient(135deg, #0a0e1a 0%, #0d1321 50%, #0a1628 100%);
-    color: #e2e8f0;
+    background-color: #0b0f19 !important;
+    color: #f1f5f9 !important;
+}
+
+header[data-testid="stHeader"] {
+    background: transparent !important;
+}
+[data-testid="stBottom"] {
+    background: transparent !important;
 }
 
 /* ── Sidebar ── */
 [data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #0d1521 0%, #0a1120 100%);
-    border-right: 1px solid rgba(99, 179, 237, 0.12);
+    background-color: #111827 !important;
+    border-right: 1px solid rgba(255, 255, 255, 0.08) !important;
 }
 [data-testid="stSidebar"] .stMarkdown p {
     color: #94a3b8;
     font-size: 0.82rem;
 }
 
-/* ── Sidebar Inputs ── */
-[data-testid="stSidebar"] .stTextInput input,
-[data-testid="stSidebar"] .stSelectbox select {
-    background: rgba(255,255,255,0.04) !important;
-    border: 1px solid rgba(99,179,237,0.2) !important;
+/* ── Inputs ── */
+.stTextInput input, .stSelectbox select {
+    background: #1e293b !important;
+    border: 1px solid rgba(255, 255, 255, 0.12) !important;
     border-radius: 8px !important;
-    color: #e2e8f0 !important;
-    font-family: 'Inter', sans-serif !important;
+    color: #f8fafc !important;
 }
-[data-testid="stSidebar"] .stTextInput input:focus {
-    border-color: rgba(99,179,237,0.6) !important;
-    box-shadow: 0 0 0 2px rgba(99,179,237,0.15) !important;
+.stTextInput input:focus {
+    border-color: #3b82f6 !important;
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.25) !important;
+}
+
+/* ── Expanders ── */
+[data-testid="stExpander"] {
+    background: #1e293b !important;
+    border: 1px solid rgba(255, 255, 255, 0.08) !important;
+    border-radius: 12px !important;
+    overflow: hidden;
+}
+[data-testid="stExpander"] summary {
+    background: #1e293b !important;
+    color: #f1f5f9 !important;
+}
+[data-testid="stExpander"] summary:hover {
+    color: #60a5fa !important;
 }
 
 /* ── File Uploader ── */
 [data-testid="stFileUploader"] {
-    background: rgba(255,255,255,0.03) !important;
-    border: 1.5px dashed rgba(99,179,237,0.25) !important;
-    border-radius: 12px !important;
-    transition: border-color 0.2s ease;
+    background: rgba(15, 23, 42, 0.6) !important;
+    border: 1.5px dashed rgba(99, 179, 237, 0.3) !important;
+    border-radius: 10px !important;
 }
-[data-testid="stFileUploader"]:hover {
-    border-color: rgba(99,179,237,0.5) !important;
+[data-testid="stFileUploader"] section {
+    background: transparent !important;
+}
+[data-testid="stFileUploader"] span, [data-testid="stFileUploader"] small {
+    color: #94a3b8 !important;
 }
 
 /* ── Buttons ── */
 .stButton > button {
-    background: linear-gradient(135deg, #1d4ed8, #2563eb) !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 10px !important;
-    font-family: 'Inter', sans-serif !important;
+    background: linear-gradient(135deg, #2563eb, #1d4ed8) !important;
+    color: #ffffff !important;
+    border: 1px solid rgba(255,255,255,0.1) !important;
+    border-radius: 8px !important;
     font-weight: 600 !important;
     font-size: 0.85rem !important;
-    padding: 0.55rem 1rem !important;
+    padding: 0.5rem 1rem !important;
     transition: all 0.2s ease !important;
-    box-shadow: 0 4px 15px rgba(37,99,235,0.3) !important;
+    box-shadow: 0 4px 12px rgba(37, 99, 235, 0.25) !important;
 }
 .stButton > button:hover {
-    transform: translateY(-1px) !important;
-    box-shadow: 0 6px 20px rgba(37,99,235,0.45) !important;
-    background: linear-gradient(135deg, #2563eb, #3b82f6) !important;
-}
-.stButton > button:active {
-    transform: translateY(0) !important;
+    background: linear-gradient(135deg, #3b82f6, #2563eb) !important;
+    box-shadow: 0 6px 16px rgba(37, 99, 235, 0.4) !important;
+    transform: translateY(-1px);
 }
 
 /* ── Chat Messages ── */
 [data-testid="stChatMessage"] {
-    background: rgba(255,255,255,0.03) !important;
-    border: 1px solid rgba(255,255,255,0.07) !important;
-    border-radius: 16px !important;
-    backdrop-filter: blur(10px) !important;
-    margin-bottom: 0.75rem !important;
+    background: #161f30 !important;
+    border: 1px solid rgba(255, 255, 255, 0.08) !important;
+    border-radius: 14px !important;
+    margin-bottom: 0.85rem !important;
     padding: 1rem 1.25rem !important;
 }
 
 /* ── Chat Input ── */
 [data-testid="stChatInput"] {
-    background: rgba(255,255,255,0.05) !important;
-    border: 1px solid rgba(99,179,237,0.25) !important;
-    border-radius: 14px !important;
-    color: #e2e8f0 !important;
-}
-[data-testid="stChatInput"]:focus-within {
-    border-color: rgba(99,179,237,0.55) !important;
-    box-shadow: 0 0 0 3px rgba(99,179,237,0.1) !important;
+    background: #1e293b !important;
+    border: 1px solid rgba(255, 255, 255, 0.15) !important;
+    border-radius: 12px !important;
+    color: #f8fafc !important;
 }
 
 /* ── Metrics ── */
 [data-testid="stMetric"] {
-    background: rgba(255,255,255,0.04) !important;
-    border: 1px solid rgba(255,255,255,0.08) !important;
-    border-radius: 12px !important;
-    padding: 0.85rem !important;
+    background: #161f30 !important;
+    border: 1px solid rgba(255, 255, 255, 0.08) !important;
+    border-radius: 10px !important;
+    padding: 0.75rem !important;
 }
 [data-testid="stMetricValue"] {
-    color: #63b3ed !important;
+    color: #60a5fa !important;
     font-weight: 700 !important;
-}
-
-/* ── Expander ── */
-[data-testid="stExpander"] {
-    background: rgba(255,255,255,0.02) !important;
-    border: 1px solid rgba(255,255,255,0.07) !important;
-    border-radius: 12px !important;
-}
-
-/* ── Selectbox ── */
-[data-testid="stSelectbox"] > div > div {
-    background: rgba(255,255,255,0.04) !important;
-    border: 1px solid rgba(99,179,237,0.2) !important;
-    border-radius: 8px !important;
-    color: #e2e8f0 !important;
-}
-
-/* ── Slider ── */
-[data-testid="stSlider"] [role="slider"] {
-    background: #3b82f6 !important;
-}
-
-/* ── Alerts / Info / Success ── */
-.stSuccess {
-    background: rgba(16,185,129,0.1) !important;
-    border: 1px solid rgba(16,185,129,0.3) !important;
-    border-radius: 10px !important;
-    color: #6ee7b7 !important;
-}
-.stInfo {
-    background: rgba(99,179,237,0.08) !important;
-    border: 1px solid rgba(99,179,237,0.2) !important;
-    border-radius: 10px !important;
-    color: #93c5fd !important;
-}
-.stError {
-    background: rgba(239,68,68,0.1) !important;
-    border: 1px solid rgba(239,68,68,0.3) !important;
-    border-radius: 10px !important;
-}
-.stWarning {
-    background: rgba(245,158,11,0.1) !important;
-    border: 1px solid rgba(245,158,11,0.3) !important;
-    border-radius: 10px !important;
 }
 
 /* ── Divider ── */
 hr {
-    border-color: rgba(255,255,255,0.08) !important;
+    border-color: rgba(255, 255, 255, 0.08) !important;
 }
 
 /* ── Header ── */
