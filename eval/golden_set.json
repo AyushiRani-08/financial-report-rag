@@ -1,0 +1,157 @@
+[
+  {
+    "id": "aapl_fy2025_eps_basic_001",
+    "ticker": "AAPL",
+    "company_name": "Apple Inc.",
+    "fiscal_period": "FY2025",
+    "category": "quantitative",
+    "question": "What was the basic earnings per share (EPS) for AAPL in FY2025?",
+    "canonical_field": "eps_basic",
+    "ground_truth_value": 6.16,
+    "ground_truth_unit": "USD",
+    "ground_truth_formatted": "$6.16",
+    "relative_tolerance": 0.015,
+    "period_end": "2023-09-30"
+  },
+  {
+    "id": "aapl_fy2025_gross_profit_002",
+    "ticker": "AAPL",
+    "company_name": "Apple Inc.",
+    "fiscal_period": "FY2025",
+    "category": "quantitative",
+    "question": "What was AAPL's gross profit in FY2025?",
+    "canonical_field": "gross_profit",
+    "ground_truth_value": 169148000000.0,
+    "ground_truth_unit": "USD",
+    "ground_truth_formatted": "$169.15 billion (169,148,000,000 USD)",
+    "relative_tolerance": 0.015,
+    "period_end": "2023-09-30"
+  },
+  {
+    "id": "aapl_fy2025_long_term_debt_003",
+    "ticker": "AAPL",
+    "company_name": "Apple Inc.",
+    "fiscal_period": "FY2025",
+    "category": "quantitative",
+    "question": "What was the total long-term debt for AAPL in FY2025?",
+    "canonical_field": "long_term_debt",
+    "ground_truth_value": 96662000000.0,
+    "ground_truth_unit": "USD",
+    "ground_truth_formatted": "$96.66 billion (96,662,000,000 USD)",
+    "relative_tolerance": 0.015,
+    "period_end": "2024-09-28"
+  },
+  {
+    "id": "aapl_fy2025_net_income_004",
+    "ticker": "AAPL",
+    "company_name": "Apple Inc.",
+    "fiscal_period": "FY2025",
+    "category": "quantitative",
+    "question": "What was the net income for AAPL in FY2025?",
+    "canonical_field": "net_income",
+    "ground_truth_value": 96995000000.0,
+    "ground_truth_unit": "USD",
+    "ground_truth_formatted": "$97.00 billion (96,995,000,000 USD)",
+    "relative_tolerance": 0.015,
+    "period_end": "2023-09-30"
+  },
+  {
+    "id": "aapl_fy2025_operating_cash_flow_005",
+    "ticker": "AAPL",
+    "company_name": "Apple Inc.",
+    "fiscal_period": "FY2025",
+    "category": "quantitative",
+    "question": "What was the operating cash flow reported by AAPL for FY2025?",
+    "canonical_field": "operating_cash_flow",
+    "ground_truth_value": 110543000000.0,
+    "ground_truth_unit": "USD",
+    "ground_truth_formatted": "$110.54 billion (110,543,000,000 USD)",
+    "relative_tolerance": 0.015,
+    "period_end": "2023-09-30"
+  },
+  {
+    "id": "aapl_fy2025_operating_income_006",
+    "ticker": "AAPL",
+    "company_name": "Apple Inc.",
+    "fiscal_period": "FY2025",
+    "category": "quantitative",
+    "question": "What was AAPL's operating income in FY2025?",
+    "canonical_field": "operating_income",
+    "ground_truth_value": 114301000000.0,
+    "ground_truth_unit": "USD",
+    "ground_truth_formatted": "$114.30 billion (114,301,000,000 USD)",
+    "relative_tolerance": 0.015,
+    "period_end": "2023-09-30"
+  },
+  {
+    "id": "aapl_fy2025_revenue_007",
+    "ticker": "AAPL",
+    "company_name": "Apple Inc.",
+    "fiscal_period": "FY2025",
+    "category": "quantitative",
+    "question": "What was Apple Inc.'s (AAPL) total revenue in FY2025?",
+    "canonical_field": "revenue",
+    "ground_truth_value": 383285000000.0,
+    "ground_truth_unit": "USD",
+    "ground_truth_formatted": "$383.29 billion (383,285,000,000 USD)",
+    "relative_tolerance": 0.015,
+    "period_end": "2023-09-30"
+  },
+  {
+    "id": "aapl_fy2025_total_assets_008",
+    "ticker": "AAPL",
+    "company_name": "Apple Inc.",
+    "fiscal_period": "FY2025",
+    "category": "quantitative",
+    "question": "What was the total asset value reported by AAPL in FY2025?",
+    "canonical_field": "total_assets",
+    "ground_truth_value": 364980000000.0,
+    "ground_truth_unit": "USD",
+    "ground_truth_formatted": "$364.98 billion (364,980,000,000 USD)",
+    "relative_tolerance": 0.015,
+    "period_end": "2024-09-28"
+  },
+  {
+    "id": "aapl_fy25_risk_supply_chain",
+    "ticker": "AAPL",
+    "fiscal_period": "FY2025",
+    "category": "qualitative",
+    "question": "What major risk factors does Apple disclose regarding supply chain and component manufacturing?",
+    "key_concepts": [
+      "single-source suppliers",
+      "concentration of manufacturing",
+      "geopolitical tensions",
+      "logistics disruptions"
+    ],
+    "expected_section": "Item 1A. Risk Factors"
+  },
+  {
+    "id": "aapl_fy25_mda_services_growth",
+    "ticker": "AAPL",
+    "fiscal_period": "FY2025",
+    "category": "qualitative",
+    "question": "How did Apple's Services division perform and what were the key drivers of growth according to MD&A?",
+    "key_concepts": [
+      "Services revenue",
+      "App Store",
+      "Cloud services",
+      "Advertising",
+      "Payment services"
+    ],
+    "expected_section": "Item 7. Management's Discussion and Analysis"
+  },
+  {
+    "id": "aapl_fy25_capital_allocation",
+    "ticker": "AAPL",
+    "fiscal_period": "FY2025",
+    "category": "qualitative",
+    "question": "What is Apple's capital return program, including share buybacks and dividend distributions?",
+    "key_concepts": [
+      "share repurchases",
+      "dividends",
+      "capital return",
+      "common stock"
+    ],
+    "expected_section": "Liquidity and Capital Resources"
+  }
+]

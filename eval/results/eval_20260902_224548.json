@@ -1,0 +1,83 @@
+{
+  "run_timestamp": "2026-09-02T22:45:48.641386",
+  "summary": {
+    "quantitative_cases": 8,
+    "quantitative_pass_rate": 0.0,
+    "qualitative_cases": 0,
+    "qualitative_pass_rate": 0
+  },
+  "results": [
+    {
+      "mode": "quantitative",
+      "ticker": "AAPL",
+      "fiscal_period": "FY2025",
+      "canonical_field": "eps_basic",
+      "question": "What was the basic earnings per share (EPS) for AAPL in FY2025?",
+      "passed": false,
+      "error": "Error code: 404 - {'error': {'message': 'The model `llama-3.3-70b-versatile` does not exist or you do not have access to it.', 'type': 'invalid_request_error', 'code': 'model_not_found'}}"
+    },
+    {
+      "mode": "quantitative",
+      "ticker": "AAPL",
+      "fiscal_period": "FY2025",
+      "canonical_field": "gross_profit",
+      "question": "What was the gross profit for AAPL in FY2025?",
+      "passed": false,
+      "error": "Error code: 404 - {'error': {'message': 'The model `llama-3.3-70b-versatile` does not exist or you do not have access to it.', 'type': 'invalid_request_error', 'code': 'model_not_found'}}"
+    },
+    {
+      "mode": "quantitative",
+      "ticker": "AAPL",
+      "fiscal_period": "FY2025",
+      "canonical_field": "long_term_debt",
+      "question": "What is the total long-term debt reported by AAPL in FY2025?",
+      "passed": false,
+      "error": "Error code: 404 - {'error': {'message': 'The model `llama-3.3-70b-versatile` does not exist or you do not have access to it.', 'type': 'invalid_request_error', 'code': 'model_not_found'}}"
+    },
+    {
+      "mode": "quantitative",
+      "ticker": "AAPL",
+      "fiscal_period": "FY2025",
+      "canonical_field": "net_income",
+      "question": "What was the net income reported by Apple Inc. (AAPL) for FY2025?",
+      "passed": false,
+      "error": "Error code: 404 - {'error': {'message': 'The model `llama-3.3-70b-versatile` does not exist or you do not have access to it.', 'type': 'invalid_request_error', 'code': 'model_not_found'}}"
+    },
+    {
+      "mode": "quantitative",
+      "ticker": "AAPL",
+      "fiscal_period": "FY2025",
+      "canonical_field": "operating_cash_flow",
+      "question": "What was the net cash from operating activities for AAPL in FY2025?",
+      "passed": false,
+      "error": "Error code: 404 - {'error': {'message': 'The model `llama-3.3-70b-versatile` does not exist or you do not have access to it.', 'type': 'invalid_request_error', 'code': 'model_not_found'}}"
+    },
+    {
+      "mode": "quantitative",
+      "ticker": "AAPL",
+      "fiscal_period": "FY2025",
+      "canonical_field": "operating_income",
+      "question": "What was Apple Inc.'s operating income in FY2025?",
+      "passed": false,
+      "error": "Error code: 404 - {'error': {'message': 'The model `llama-3.3-70b-versatile` does not exist or you do not have access to it.', 'type': 'invalid_request_error', 'code': 'model_not_found'}}"
+    },
+    {
+      "mode": "quantitative",
+      "ticker": "AAPL",
+      "fiscal_period": "FY2025",
+      "canonical_field": "revenue",
+      "question": "What was Apple Inc.'s total revenue (net sales) for FY2025?",
+      "passed": false,
+      "error": "Error code: 404 - {'error': {'message': 'The model `llama-3.3-70b-versatile` does not exist or you do not have access to it.', 'type': 'invalid_request_error', 'code': 'model_not_found'}}"
+    },
+    {
+      "mode": "quantitative",
+      "ticker": "AAPL",
+      "fiscal_period": "FY2025",
+      "canonical_field": "total_assets",
+      "question": "What were the total assets of Apple Inc. as of the end of FY2025?",
+      "passed": false,
+      "error": "Error code: 404 - {'error': {'message': 'The model `llama-3.3-70b-versatile` does not exist or you do not have access to it.', 'type': 'invalid_request_error', 'code': 'model_not_found'}}"
+    }
+  ]
+}

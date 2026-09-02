@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 # Core investor-facing facts to surface in RAG context
 DEFAULT_CANONICAL_FIELDS = [
     "revenue",
+    "gross_profit",
     "net_income",
     "operating_income",
     "eps_basic",
@@ -80,10 +81,8 @@ class XBRLRetriever:
         period_filter = ""
         params: list = [ticker, fields]
         if fiscal_period:
-            period_filter = "AND f.fiscal_period = %s"
+            period_filter = "AND fi.fiscal_period = %s"
             params.append(fiscal_period)
-
-        params.append(limit_periods)
 
         query = f"""
             SELECT
@@ -183,12 +182,20 @@ class XBRLRetriever:
             f"[Structured Financial Data | {ticker} | {period_label}]",
             "-" * 55,
         ]
+
+        # Deduplicate to latest period_end per canonical field
+        deduped = {}
         for f in facts:
+            field = f["canonical_field"]
+            p_end = str(f.get("period_end") or "")
+            if field not in deduped or p_end > str(deduped[field].get("period_end") or ""):
+                deduped[field] = f
+
+        for field, f in sorted(deduped.items()):
             val = f["value"]
             unit = f["unit"] or ""
-            label = f["canonical_field"].replace("_", " ").title()
+            label = field.replace("_", " ").title()
             if val is not None:
-                # Format large numbers with commas
                 formatted = f"{val:,.2f}" if abs(val) >= 1 else f"{val:.4f}"
                 lines.append(f"  {label:<30} {formatted:>18} {unit}")
             else:
