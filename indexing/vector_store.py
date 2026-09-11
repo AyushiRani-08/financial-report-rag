@@ -76,7 +76,7 @@ class VectorStore:
             metadatas=metadatas,
         )
         print(
-            f"✅ Successfully stored {len(embedded_chunks)} chunks for {paper_id}."
+            f"[OK] Successfully stored {len(embedded_chunks)} chunks for {paper_id}."
         )
         return len(embedded_chunks)
 

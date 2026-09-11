@@ -8,8 +8,11 @@ import os
 import logging
 from typing import Optional
 
+from dotenv import load_dotenv
 import psycopg2
 import psycopg2.extras
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -17,16 +20,31 @@ logger = logging.getLogger(__name__)
 DEFAULT_CANONICAL_FIELDS = [
     "revenue",
     "gross_profit",
-    "net_income",
+    "cost_of_revenue",
     "operating_income",
+    "operating_expenses",
+    "rd_expense",
+    "sga_expense",
+    "pretax_income",
+    "income_tax_expense",
+    "net_income",
     "eps_basic",
     "eps_diluted",
+    "shares_outstanding",
     "total_assets",
-    "total_liabilities",
-    "stockholders_equity",
-    "long_term_debt",
+    "current_assets",
     "cash",
+    "cash_and_investments",
+    "total_liabilities",
+    "current_liabilities",
+    "long_term_debt",
+    "stockholders_equity",
     "operating_cash_flow",
+    "investing_cash_flow",
+    "financing_cash_flow",
+    "capex",
+    "share_repurchases",
+    "dividends_paid",
 ]
 
 

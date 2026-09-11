@@ -121,14 +121,34 @@ def check_numerical(model_answer: str, ground_truth: float, tolerance: float = 0
 # ─────────────────────────────────────────────────────────────
 
 QUANT_TEMPLATES = {
-    "revenue":            "What was {name}'s total revenue (net sales) for {period}?",
-    "net_income":         "What was the net income reported by {name} ({ticker}) for {period}?",
-    "operating_income":   "What was {name}'s operating income in {period}?",
-    "gross_profit":       "What was the gross profit for {ticker} in {period}?",
-    "eps_basic":          "What was the basic earnings per share (EPS) for {ticker} in {period}?",
-    "operating_cash_flow":"What was the net cash from operating activities for {ticker} in {period}?",
-    "long_term_debt":     "What is the total long-term debt reported by {ticker} in {period}?",
-    "total_assets":       "What were the total assets of {name} as of the end of {period}?",
+    # Income Statement
+    "revenue":             "What was {name}'s total revenue (net sales) for {period}?",
+    "cost_of_revenue":     "What was {name}'s cost of revenue (cost of sales) in {period}?",
+    "gross_profit":        "What was the gross profit for {ticker} in {period}?",
+    "rd_expense":          "What was {name}'s research and development (R&D) expense in {period}?",
+    "sga_expense":         "What was {name}'s SG&A expense in {period}?",
+    "operating_expenses":  "What were the total operating expenses reported by {ticker} in {period}?",
+    "operating_income":    "What was {name}'s operating income in {period}?",
+    "pretax_income":       "What was {name}'s income before taxes (pre-tax income) in {period}?",
+    "income_tax_expense":  "What was the provision for income taxes for {ticker} in {period}?",
+    "net_income":          "What was the net income reported by {name} ({ticker}) for {period}?",
+    "eps_basic":           "What was the basic earnings per share (EPS) for {ticker} in {period}?",
+    "eps_diluted":         "What was the diluted earnings per share (EPS) for {ticker} in {period}?",
+
+    # Balance Sheet
+    "cash":                "What was the cash and cash equivalents balance for {ticker} at the end of {period}?",
+    "current_assets":      "What were the total current assets for {name} in {period}?",
+    "total_assets":        "What were the total assets of {name} as of the end of {period}?",
+    "current_liabilities": "What were the total current liabilities for {name} in {period}?",
+    "long_term_debt":      "What is the total long-term debt reported by {ticker} in {period}?",
+    "total_liabilities":   "What were the total liabilities reported by {ticker} for {period}?",
+    "stockholders_equity": "What was the total shareholders' equity for {name} at the end of {period}?",
+
+    # Cash Flow & Capital Allocation
+    "operating_cash_flow": "What was the net cash from operating activities for {ticker} in {period}?",
+    "capex":               "What were the capital expenditures (payments for property, plant, and equipment) for {ticker} in {period}?",
+    "share_repurchases":   "How much did {name} spend on share repurchases (buybacks) in {period}?",
+    "dividends_paid":      "How much did {ticker} pay in dividends in {period}?",
 }
 
 
@@ -148,22 +168,20 @@ def fetch_quant_ground_truths(conn, ticker_filter=None, period_filter=None) -> l
         SELECT
             c.ticker, c.name AS company_name, fi.fiscal_period,
             ff.canonical_field,
-            MAX(ff.value)       AS value,
+            ff.value,
             ff.unit,
             ff.period_start, ff.period_end
         FROM financial_facts ff
         JOIN filings fi   ON fi.filing_id  = ff.filing_id
         JOIN companies c  ON c.company_id  = fi.company_id
         WHERE {' AND '.join(where_clauses)}
-        GROUP BY c.ticker, c.name, fi.fiscal_period,
-                 ff.canonical_field, ff.unit, ff.period_start, ff.period_end
-        ORDER BY c.ticker, fi.fiscal_period DESC, ff.period_end DESC
+        ORDER BY c.ticker, fi.fiscal_period DESC, ff.period_end DESC, ff.fact_id DESC
     """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(query, params)
         rows = cur.fetchall()
 
-    # Deduplicate: first occurrence is the latest reporting period_end for that fiscal period
+    # Deduplicate: first occurrence has the latest reporting period_end for that fiscal period
     seen = {}
     for r in rows:
         key = (r["ticker"], r["fiscal_period"], r["canonical_field"])
