@@ -183,44 +183,83 @@ class XBRLRetriever:
         ticker: str,
         fiscal_period: Optional[str] = None,
         canonical_fields: Optional[list[str]] = None,
+        query: Optional[str] = None,
     ) -> str:
         """
-        Format structured XBRL facts as a plain-text block for injection
-        into a RAG prompt context window.
-
-        Returns empty string if no facts are found (graceful degradation).
+        Format structured XBRL facts as plain-text blocks for injection
+        into a RAG prompt context window. Supports single-period, multi-period,
+        and query-based fiscal period resolution.
         """
         facts = self.get_key_financials(ticker, fiscal_period, canonical_fields)
         if not facts:
             logger.debug("No XBRL facts found for ticker=%s period=%s", ticker, fiscal_period)
             return ""
 
-        period_label = fiscal_period or (facts[0]["fiscal_period"] if facts else "unknown")
-        lines = [
-            f"[Structured Financial Data | {ticker} | {period_label}]",
-            "-" * 55,
-        ]
-
-        # Deduplicate to latest period_end per canonical field
-        deduped = {}
+        # Group facts by fiscal_period -> canonical_field
+        by_period: dict[str, dict[str, dict]] = {}
         for f in facts:
+            p = f["fiscal_period"] or "Latest"
+            if p not in by_period:
+                by_period[p] = {}
             field = f["canonical_field"]
             p_end = str(f.get("period_end") or "")
-            if field not in deduped or p_end > str(deduped[field].get("period_end") or ""):
-                deduped[field] = f
+            if field not in by_period[p] or p_end > str(by_period[p][field].get("period_end") or ""):
+                by_period[p][field] = f
 
-        for field, f in sorted(deduped.items()):
-            val = f["value"]
-            unit = f["unit"] or ""
-            label = field.replace("_", " ").title()
-            if val is not None:
-                formatted = f"{val:,.2f}" if abs(val) >= 1 else f"{val:.4f}"
-                lines.append(f"  {label:<30} {formatted:>18} {unit}")
-            else:
-                lines.append(f"  {label:<30} {'N/A':>18}")
+        # Determine which periods to format
+        selected_periods: list[str] = []
+        if fiscal_period and fiscal_period in by_period:
+            selected_periods = [fiscal_period]
+        elif query:
+            q_lower = query.lower()
+            # Match specific years and quarters in query
+            for p in by_period.keys():
+                p_lower = p.lower()
+                # Check for explicit year match (e.g. 2024, 2023)
+                for y in ("2026", "2025", "2024", "2023", "2022", "2021", "2020"):
+                    if y in q_lower and y in p_lower:
+                        if ("q1" in q_lower or "first quarter" in q_lower) and "q1" in p_lower:
+                            if p not in selected_periods: selected_periods.append(p)
+                        elif ("q2" in q_lower or "second quarter" in q_lower) and "q2" in p_lower:
+                            if p not in selected_periods: selected_periods.append(p)
+                        elif ("q3" in q_lower or "third quarter" in q_lower) and "q3" in p_lower:
+                            if p not in selected_periods: selected_periods.append(p)
+                        elif ("q4" in q_lower or "fourth quarter" in q_lower) and "q4" in p_lower:
+                            if p not in selected_periods: selected_periods.append(p)
+                        elif not any(q in q_lower for q in ("q1", "q2", "q3", "q4", "first quarter", "second quarter", "third quarter", "fourth quarter")):
+                            if p not in selected_periods: selected_periods.append(p)
+            
+            # Also check if query asks for prior year / YoY comparison
+            if any(term in q_lower for term in ("prior year", "compare", "yoy", "growth", "previous year", "last year")):
+                for p in list(by_period.keys()):
+                    if ("2023" in p or "2022" in p) and p not in selected_periods:
+                        selected_periods.append(p)
 
-        lines.append("-" * 55)
-        return "\n".join(lines)
+        if not selected_periods:
+            # Default to top 3 most recent periods
+            selected_periods = list(by_period.keys())[:3]
+
+        blocks = []
+        for p in selected_periods:
+            if p not in by_period:
+                continue
+            lines = [
+                f"[Structured Financial Data | {ticker} | {p}]",
+                "-" * 55,
+            ]
+            for field, f in sorted(by_period[p].items()):
+                val = f["value"]
+                unit = f["unit"] or ""
+                label = field.replace("_", " ").title()
+                if val is not None:
+                    formatted = f"{val:,.2f}" if abs(val) >= 1 else f"{val:.4f}"
+                    lines.append(f"  {label:<30} {formatted:>18} {unit}")
+                else:
+                    lines.append(f"  {label:<30} {'N/A':>18}")
+            lines.append("-" * 55)
+            blocks.append("\n".join(lines))
+
+        return "\n\n".join(blocks)
 
     def __enter__(self):
         return self

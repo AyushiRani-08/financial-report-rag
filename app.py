@@ -4,8 +4,25 @@ import streamlit as st
 from dotenv import load_dotenv
 import os
 
+import sys
+import importlib
+
+import ingestion.sec_fetcher
+import retrieval.retriever
+import retrieval.xbrl_retriever
+import generation.generator
+import indexing.vector_store
+
+importlib.reload(ingestion.sec_fetcher)
+importlib.reload(retrieval.retriever)
+importlib.reload(retrieval.xbrl_retriever)
+importlib.reload(generation.generator)
+importlib.reload(indexing.vector_store)
+
 from generation.generator import RAGGenerator
 from indexing.vector_store import VectorStore
+from ingestion.sec_fetcher import download_sec_filing, fetch_and_store_xbrl
+from privacy import redact_query, get_redaction_summary, get_engine_status
 
 load_dotenv()
 
@@ -218,13 +235,75 @@ if not hasattr(vector_store, "add_document") or not hasattr(rag_generator, "gene
     st.cache_resource.clear()
     st.rerun()
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=5)  # Short TTL so new docs appear quickly
 def get_indexed_documents(_collection):
     try:
         metas = _collection.get(include=["metadatas"])["metadatas"]
         return sorted(list({m["paper_id"] for m in metas if m and "paper_id" in m}))
     except Exception:
         return []
+
+
+COMPANY_TICKER_MAP = {
+    "tesla": "TSLA",
+    "microsoft": "MSFT",
+    "apple": "AAPL",
+    "amazon": "AMZN",
+    "google": "GOOGL",
+    "alphabet": "GOOGL",
+    "meta": "META",
+    "facebook": "META",
+    "nvidia": "NVDA",
+    "jpmc": "JPM",
+    "jpmorgan": "JPM",
+    "jpm": "JPM",
+    "boeing": "BA",
+    "berkshire": "BRK-B",
+    "asml": "ASML",
+    "baba": "BABA",
+    "alibaba": "BABA",
+}
+
+
+def _parse_ticker_and_period(doc_name: str):
+    """
+    Auto-detect ticker and period from SEC filing filename or company name.
+    Examples:
+      msft-20240331   -> (MSFT, Q3FY2024)   [10-Q]
+      aapl-20250927   -> (AAPL, FY2025)      [10-K, Sep year-end]
+      msft-20250630   -> (MSFT, FY2025)      [10-K, Jun year-end]
+      tesla           -> (TSLA, None)
+      tsla            -> (TSLA, None)
+    Returns (ticker, period) or (None, None) if not parseable.
+    """
+    import re
+    clean = doc_name.lower().replace(".html", "").replace(".htm", "").replace(".pdf", "").strip()
+
+    # Direct company name match (e.g. "tesla", "microsoft")
+    if clean in COMPANY_TICKER_MAP:
+        return COMPANY_TICKER_MAP[clean], None
+
+    # Standard SEC filing regex: ticker-YYYYMMDD
+    m = re.match(r'^([a-zA-Z]+)[-_](\d{4})(\d{2})(\d{2})', doc_name)
+    if not m:
+        for comp, tick in COMPANY_TICKER_MAP.items():
+            if comp in clean:
+                return tick, None
+        if len(clean) in (3, 4, 5) and clean.isalpha():
+            return clean.upper(), None
+        return None, None
+
+    raw_prefix = m.group(1).lower()
+    ticker = COMPANY_TICKER_MAP.get(raw_prefix, m.group(1).upper())
+    year, month, day = int(m.group(2)), int(m.group(3)), int(m.group(4))
+    if month in (6, 9, 12) and day >= 28:
+        fy = year if month >= 4 else year - 1
+        period = f"FY{fy}"
+    elif month == 3:
+        period = f"Q3FY{year - 1}" if year > 2000 else None
+    else:
+        period = None
+    return ticker, period
 
 
 # ─────────────────────────────────────────────
@@ -240,11 +319,71 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Section 1: Document Ingestion ──
-    st.markdown('<div class="section-label">📄 Document Ingestion</div>', unsafe_allow_html=True)
+    # ── Section 1: 1-Click Company Search & Ingest ──
+    st.markdown('<div class="section-label">⚡ 1-Click Company Loader</div>', unsafe_allow_html=True)
+    with st.expander("🔍 Search & Auto-Load Company", expanded=True):
+        st.caption("Type any US company. FinSight auto-downloads the full 150+ page filing & verified numbers in 1 click.")
+        auto_comp_input = st.text_input(
+            "Company Name or Ticker",
+            placeholder="e.g. Boeing, BA, Apple, TSLA, JPM, MSFT",
+            key="auto_company_input",
+        ).strip()
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            auto_form_sel = st.selectbox("Filing Type", ["10-K (Annual)", "10-Q (Quarterly)"], key="auto_form_sel")
+        with col_f2:
+            auto_year_input = st.text_input("Fiscal Year (opt)", placeholder="e.g. 2024", key="auto_year_input").strip()
 
-    with st.expander("Upload Filing (PDF / HTML)", expanded=True):
-        st.caption("SEC 10-K, 10-Q, Annual Reports, HTML filings")
+        form_code = "10-Q" if "10-Q" in auto_form_sel else "10-K"
+        year_val = int(auto_year_input) if auto_year_input.isdigit() else None
+
+        if st.button("🚀 Load Complete Filing & Facts", use_container_width=True, key="btn_auto_load_company", disabled=not auto_comp_input):
+            clean_comp = auto_comp_input.lower()
+            resolved_ticker = COMPANY_TICKER_MAP.get(clean_comp, auto_comp_input.upper())
+
+            prog_box = st.empty()
+            p_logs = []
+            def _p_log(msg):
+                p_logs.append(msg)
+                prog_box.info("\n\n".join(p_logs))
+
+            with st.spinner(f"Auto-fetching official SEC report & XBRL facts for **{resolved_ticker}**..."):
+                try:
+                    f_info = download_sec_filing(
+                        ticker=resolved_ticker,
+                        form_type=form_code,
+                        fiscal_year=year_val,
+                        progress_callback=_p_log,
+                    )
+                    _p_log(f"Embedding {f_info['file_name']} ({f_info['size_mb']} MB) into vector database...")
+                    chunk_count = vector_store.add_document(f_info["file_path"])
+                    st.cache_data.clear()
+
+                    _p_log(f"Loading official SEC XBRL facts for {resolved_ticker}...")
+                    x_res = fetch_and_store_xbrl(
+                        ticker=resolved_ticker,
+                        form_type=form_code,
+                        progress_callback=_p_log,
+                    )
+
+                    prog_box.empty()
+                    st.success(
+                        f"✅ Loaded **{f_info['company_name']}** ({resolved_ticker})  \n"
+                        f"📄 Document: `{f_info['file_name']}` (**{chunk_count} chunks**, {f_info['size_mb']} MB)  \n"
+                        f"📊 Verified Numbers: **{x_res['facts_inserted']:,} facts** loaded"
+                    )
+                    st.session_state["auto_ticker"] = resolved_ticker
+                    periods = x_res.get("periods_found", [])
+                    st.session_state["auto_period"] = periods[-1] if periods else None
+                    st.rerun()
+                except Exception as e:
+                    prog_box.empty()
+                    st.error(f"Auto-load failed: {e}")
+                    st.exception(e)
+
+    # ── Section 2: Custom Document Upload ──
+    with st.expander("📁 Upload Custom Filing (PDF / HTML)", expanded=False):
+        st.caption("Optional: Upload custom downloaded financial PDFs or HTML filings.")
         uploaded_doc = st.file_uploader(
             "Drop PDF or HTML here",
             type=["pdf", "html", "htm"],
@@ -252,77 +391,96 @@ with st.sidebar:
             label_visibility="collapsed",
         )
         if uploaded_doc and st.button("⬆ Index Document", use_container_width=True, key="btn_index_doc"):
-            raw_dir = Path("data/raw_pdfs")
+            raw_dir = Path(__file__).resolve().parent / "data" / "raw_pdfs"
             raw_dir.mkdir(parents=True, exist_ok=True)
             clean_name = "".join(c for c in uploaded_doc.name if c.isalnum() or c in (".", "_", "-"))
             save_path = raw_dir / clean_name
             with open(save_path, "wb") as f:
                 f.write(uploaded_doc.getbuffer())
-            with st.spinner(f"Parsing & embedding `{clean_name}`..."):
+            with st.spinner(f"Parsing & embedding `{clean_name}`... (this may take 30–60s)"):
                 try:
                     count = vector_store.add_document(str(save_path))
                     st.cache_data.clear()
-                    st.success(f"Indexed **{count}** chunks from `{clean_name}`")
+                    doc_stem = Path(clean_name).stem
+                    auto_ticker, auto_period = _parse_ticker_and_period(doc_stem)
+                    st.success(f"✅ Indexed **{count}** chunks from `{clean_name}`")
+                    if auto_ticker:
+                        st.info(f"🔗 Auto-detected: **{auto_ticker}** · {auto_period or 'unknown period'}")
+                        st.session_state["auto_ticker"] = auto_ticker
+                        st.session_state["auto_period"] = auto_period
                     st.rerun()
                 except Exception as e:
                     st.error(f"Indexing failed: {e}")
-
-    with st.expander("Upload XBRL (.xml) for Exact Numbers", expanded=False):
-        st.caption("Links verified SEC financial figures to PostgreSQL")
-        uploaded_xbrl = st.file_uploader(
-            "Drop XBRL XML here",
-            type=["xml"],
-            key="xbrl_uploader",
-            label_visibility="collapsed",
-        )
-        xbrl_ticker_input = st.text_input(
-            "Ticker", placeholder="AAPL", key="xbrl_ticker_input"
-        ).strip().upper()
-        xbrl_name_input = st.text_input(
-            "Company Name", placeholder="Apple Inc.", key="xbrl_name_input"
-        ).strip()
-        xbrl_form_input = st.selectbox(
-            "Form Type", ["10-K", "10-Q", "AOC-4", "Annual Report"], key="xbrl_form"
-        )
-        xbrl_period_input = st.text_input(
-            "Fiscal Period", placeholder="FY2024", key="xbrl_period_input"
-        ).strip()
-        xbrl_market_input = st.selectbox("Market", ["US", "IN"], key="xbrl_market")
-
-        can_ingest_xbrl = (
-            uploaded_xbrl and xbrl_ticker_input and xbrl_name_input and xbrl_period_input
-        )
-        if st.button(
-            "⚡ Ingest XBRL into Database",
-            use_container_width=True,
-            key="btn_ingest_xbrl",
-            disabled=not can_ingest_xbrl,
-        ):
-            xbrl_dir = Path("data/xbrl")
-            xbrl_dir.mkdir(parents=True, exist_ok=True)
-            xbrl_path = xbrl_dir / uploaded_xbrl.name
-            with open(xbrl_path, "wb") as f:
-                f.write(uploaded_xbrl.getbuffer())
-            with st.spinner(f"Parsing XBRL for **{xbrl_ticker_input}**..."):
-                try:
-                    from ingestion.xbrl_parser import parse_xbrl_to_db
-                    count = parse_xbrl_to_db(
-                        xbrl_path=str(xbrl_path),
-                        ticker=xbrl_ticker_input,
-                        company_name=xbrl_name_input,
-                        form_type=xbrl_form_input,
-                        fiscal_period=xbrl_period_input,
-                        market=xbrl_market_input,
-                    )
-                    st.success(f"Inserted **{count}** facts for `{xbrl_ticker_input}` into PostgreSQL")
-                except Exception as e:
-                    st.error(f"XBRL ingestion failed: {e}")
                     st.exception(e)
+
+
+    with st.expander("⚡ Fetch XBRL from SEC EDGAR", expanded=False):
+        st.caption("Auto-downloads verified financial facts for any US public company.")
+        fetch_ticker = st.text_input(
+            "Ticker Symbol", placeholder="e.g. MSFT, TSLA, GOOGL",
+            key="fetch_ticker_input"
+        ).strip().upper()
+        fetch_period = st.text_input(
+            "Fiscal Period (optional)", placeholder="e.g. FY2025 — leave blank for all",
+            key="fetch_period_input"
+        ).strip() or None
+        fetch_form = st.selectbox(
+            "Form Type", ["10-K", "10-Q"], key="fetch_form_type"
+        )
+
+        if st.button(
+            "🌐 Fetch from SEC EDGAR",
+            use_container_width=True,
+            key="btn_fetch_sec",
+            disabled=not fetch_ticker,
+        ):
+            # Warn if period format looks wrong for 10-Q
+            if fetch_form == "10-Q" and fetch_period and fetch_period.startswith("FY"):
+                st.warning(
+                    "⚠️ For 10-Q, leave the period blank to get all quarters. "
+                    "FY-format periods only apply to 10-K annual filings. Fetching all quarters now..."
+                )
+            from ingestion.sec_fetcher import fetch_and_store_xbrl
+            progress_box = st.empty()
+            logs = []
+            def _progress(msg):
+                logs.append(msg)
+                progress_box.info("\n\n".join(logs))
+
+            with st.spinner(f"Fetching XBRL facts for **{fetch_ticker}** from SEC..."):
+                try:
+                    result = fetch_and_store_xbrl(
+                        ticker=fetch_ticker,
+                        fiscal_period=fetch_period,
+                        form_type=fetch_form,
+                        progress_callback=_progress,
+                    )
+                    progress_box.empty()
+                    st.success(
+                        f"✅ **{result['company_name']}** ({result['ticker']})  \n"
+                        f"Inserted **{result['facts_inserted']:,}** facts  \n"
+                        f"Periods: `{'`, `'.join(result['periods_found']) or 'none'}`"
+                    )
+                    st.caption(f"CIK: `{result['cik']}` · Source: SEC EDGAR companyfacts API")
+                    # Activate XBRL grounding immediately — don't wait for filename detection
+                    if result["facts_inserted"] > 0:
+                        st.session_state["auto_ticker"] = result["ticker"]
+                        # For 10-Q: activate the most recent quarter fetched
+                        # For 10-K: activate the most recent fiscal year
+                        periods = result["periods_found"]
+                        st.session_state["auto_period"] = periods[-1] if periods else None
+                        st.rerun()
+                except Exception as e:
+                    progress_box.empty()
+                    st.error(f"Fetch failed: {e}")
+                    st.exception(e)
+
+
 
     st.divider()
 
-    # ── Section 2: Query Controls ──
-    st.markdown('<div class="section-label">🔍 Query Controls</div>', unsafe_allow_html=True)
+    # ── Section 2: Indexed Documents ──
+    st.markdown('<div class="section-label">📂 Indexed Documents</div>', unsafe_allow_html=True)
 
     available_docs = get_indexed_documents(vector_store.collection)
     total_chunks = vector_store.collection.count()
@@ -333,41 +491,99 @@ with st.sidebar:
     with col_m2:
         st.metric("Docs", len(available_docs))
 
+    if not available_docs:
+        st.caption("📤 Upload or auto-load a filing above to get started.")
+
+    doc_options = ["🌐 All Documents (Auto-Route)"] + available_docs
     selected_doc = st.selectbox(
-        "Filter Document",
-        options=["All Documents"] + available_docs,
+        "Active Document Scope",
+        options=doc_options,
+        index=0,
         key="doc_filter",
+        help="Choose 'All Documents' to let FinSight automatically search all filings and pull the relevant company's numbers, or select a specific filing.",
     )
-    target_paper = None if selected_doc == "All Documents" else selected_doc
+    is_global = selected_doc.startswith("🌐") or selected_doc == "All Documents"
+    target_paper = None if is_global else selected_doc
     top_k = st.slider("Context Chunks (Top-K)", min_value=1, max_value=8, value=4)
 
-    st.divider()
+    # ── Auto XBRL: detect ticker+period from selected document or query ──
+    if not is_global:
+        auto_t, auto_p = _parse_ticker_and_period(selected_doc)
+        xbrl_ticker = auto_t or None
+        xbrl_period = auto_p or None
+    else:
+        xbrl_ticker = None
+        xbrl_period = None
 
-    # ── Section 3: XBRL Grounding ──
-    st.markdown('<div class="section-label">🗄️ XBRL Grounding</div>', unsafe_allow_html=True)
-    st.caption("Link a ticker to inject verified numbers into every answer.")
-
-    xbrl_ticker = st.text_input(
-        "Active Ticker", placeholder="e.g. AAPL", key="active_ticker"
-    ).strip().upper() or None
-
-    xbrl_period = st.text_input(
-        "Active Period", placeholder="e.g. FY2024", key="active_period"
-    ).strip() or None
-
-    if xbrl_ticker:
+    if is_global:
         st.markdown(
-            f'<span class="pill pill-green">● XBRL ON</span>&nbsp;'
-            f'<span class="pill pill-blue">{xbrl_ticker}</span>&nbsp;'
-            f'<span class="pill pill-amber">{xbrl_period or "latest"}</span>',
+            '<span class="pill pill-blue">🌐 Global Search</span>&nbsp;'
+            '<span class="pill pill-green">⚡ Auto-Routes XBRL</span>',
             unsafe_allow_html=True,
         )
+        st.caption("Auto-detects company from your question & retrieves matching verified facts.")
+    elif xbrl_ticker:
+        st.markdown(
+            f'<span class="pill pill-green">● XBRL</span>&nbsp;'
+            f'<span class="pill pill-blue">{xbrl_ticker}</span>&nbsp;'
+            f'<span class="pill pill-amber">{xbrl_period or "all periods"}</span>',
+            unsafe_allow_html=True,
+        )
+        st.caption(f"Strictly filtering to **{selected_doc}**.")
     else:
         st.markdown(
-            '<span class="pill pill-amber">○ XBRL OFF</span>&emsp;'
-            '<span style="color:#475569;font-size:0.75rem;">Set ticker to activate</span>',
+            '<span class="pill pill-amber">○ Text Only</span>',
             unsafe_allow_html=True,
         )
+        st.caption(f"Filtering text chunks to **{selected_doc}**.")
+
+    # ── Manage Indexed Documents & Session ──
+    with st.expander("⚙️ Session & Document Tools", expanded=False):
+        if available_docs:
+            doc_to_del = st.selectbox("Select document to delete", available_docs, key="sel_doc_del")
+            if st.button("🗑️ Remove Document", use_container_width=True, key="btn_del_doc"):
+                del_count = vector_store.delete_document(doc_to_del)
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.success(f"Removed `{doc_to_del}` ({del_count} chunks deleted).")
+                st.rerun()
+        if st.button("🧹 Clear Chat History", use_container_width=True, key="btn_clear_chat"):
+            st.session_state.messages = []
+            st.rerun()
+        if st.button("🔄 Reset Cache", use_container_width=True, key="btn_reset_cache"):
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.rerun()
+
+    # ── Privacy Shield Status ──
+    st.divider()
+    try:
+        _ps = get_engine_status()
+        _engine_label = _ps["active_nlp_engine"].upper()
+        _engine_color = "#10b981" if _engine_label != "REGEX-ONLY" else "#f59e0b"
+    except Exception:
+        _engine_label = "REGEX-ONLY"
+        _engine_color = "#f59e0b"
+    st.markdown(f"""
+    <div style="
+        background: linear-gradient(135deg, rgba(16,185,129,0.08), rgba(59,130,246,0.06));
+        border: 1px solid rgba(16,185,129,0.25);
+        border-radius: 10px;
+        padding: 0.75rem 1rem;
+        margin-top: 0.25rem;
+    ">
+        <div style="font-size:0.75rem; font-weight:700; color:#10b981; letter-spacing:0.05em; margin-bottom:4px;">
+            🔒 PRIVACY SHIELD ACTIVE
+        </div>
+        <div style="font-size:0.72rem; color:#64748b; line-height:1.6;">
+            In-flight redaction on every query.<br>
+            PII &amp; sensitive financial data masked before the AI sees it.<br>
+            <span style="color:{_engine_color}; font-weight:600;">Engine: {_engine_label}</span>
+            &nbsp;+&nbsp;<span style="color:#3b82f6; font-weight:600;">REGEX</span><br>
+            <span style="color:#475569;">Audit log → <code>logs/redactions.log</code></span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────
@@ -390,14 +606,17 @@ st.markdown("""
 # ── Action Row ──
 col_label, col_btn = st.columns([4, 1])
 with col_label:
-    active_doc_label = f"📂 `{selected_doc}`"
-    if xbrl_ticker:
-        active_doc_label += f" &nbsp;·&nbsp; " \
-            f'<span class="pill pill-green">{xbrl_ticker}</span> ' \
-            f'<span class="pill pill-blue">{xbrl_period or "latest"}</span>'
+    if is_global:
+        active_doc_label = '🌐 <span class="pill pill-blue">All Indexed Documents</span> &nbsp;·&nbsp; <span class="pill pill-green">Auto-Routes Company & Facts</span>'
+    else:
+        active_doc_label = f"📂 `{selected_doc}`"
+        if xbrl_ticker:
+            active_doc_label += f" &nbsp;·&nbsp; " \
+                f'<span class="pill pill-green">{xbrl_ticker}</span> ' \
+                f'<span class="pill pill-blue">{xbrl_period or "latest"}</span>'
     st.markdown(
         f'<div style="color:#64748b; font-size:0.85rem; padding-top:0.6rem;">'
-        f'Filtering: {active_doc_label}</div>',
+        f'Scope: {active_doc_label}</div>',
         unsafe_allow_html=True,
     )
 with col_btn:
@@ -497,19 +716,72 @@ if generate_report_btn:
 
 
 # ─────────────────────────────────────────────
-# CUSTOM Q&A CHAT INPUT
+# INLINE CHAT ATTACHMENT & INPUT
 # ─────────────────────────────────────────────
-if prompt := st.chat_input("Ask about revenue, debt, risks, margins, EPS..."):
+active_attached_doc = st.session_state.get("attached_doc")
+
+col_att1, col_att2 = st.columns([2.2, 4.8])
+with col_att1:
+    with st.popover("📎 Attach Filing / XBRL / CSV", use_container_width=True):
+        st.markdown("**Upload financial document directly into chat:**")
+        st.caption("Supports SEC 10-K/10-Q (PDF/HTML), XBRL JSON, CSV financial tables, TXT, MD.")
+        inline_file = st.file_uploader(
+            "Drop file here",
+            type=["pdf", "html", "htm", "json", "csv", "txt", "md", "xml"],
+            key="inline_chat_uploader",
+            label_visibility="collapsed",
+        )
+        if inline_file:
+            raw_dir = Path(__file__).resolve().parent / "data" / "raw_pdfs"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            clean_name = "".join(c for c in inline_file.name if c.isalnum() or c in (".", "_", "-"))
+            save_path = raw_dir / clean_name
+            with open(save_path, "wb") as f:
+                f.write(inline_file.getbuffer())
+            
+            if st.button("⚡ Index & Chat with File", use_container_width=True, key="btn_index_inline"):
+                with st.spinner(f"Indexing `{clean_name}` into vector store..."):
+                    c_count = vector_store.add_document(str(save_path))
+                    st.cache_data.clear()
+                    st.cache_resource.clear()
+                    doc_stem = Path(clean_name).stem
+                    st.session_state["attached_doc"] = doc_stem
+                    auto_t, auto_p = _parse_ticker_and_period(doc_stem)
+                    if auto_t:
+                        st.session_state["auto_ticker"] = auto_t
+                    st.success(f"✅ Ready! `{clean_name}` ({c_count} chunks indexed).")
+                    st.rerun()
+
+with col_att2:
+    if active_attached_doc:
+        st.markdown(
+            f'<div style="padding-top:0.4rem;">'
+            f'<span class="pill pill-green">📎 Attached: <b>{active_attached_doc}</b></span> '
+            f'<span style="color:#94a3b8; font-size:0.8rem; margin-left:0.5rem;">Ready for analysis</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+# Target document prioritizing attached doc if present
+effective_paper_id = active_attached_doc or target_paper
+
+if prompt := st.chat_input("Ask about revenue, debt, risks, margins, EPS or your attached file..."):
+    # ── Privacy: redact PII / sensitive data from user input ──
+    clean_prompt, pii_findings = redact_query(prompt)
+    privacy_badge = get_redaction_summary(pii_findings)
+
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
+        if privacy_badge:
+            st.caption(privacy_badge)
 
     with st.chat_message("assistant"):
         with st.spinner("Retrieving context and generating analyst response..."):
             response_data = rag_generator.generate_answer(
-                query=prompt,
+                query=clean_prompt,          # use sanitised query
                 top_k=top_k,
-                paper_id=target_paper,
+                paper_id=effective_paper_id,
                 ticker=xbrl_ticker,
                 fiscal_period=xbrl_period,
             )

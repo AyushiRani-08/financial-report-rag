@@ -1,27 +1,58 @@
-# Document parsing & HTML processing
-pymupdf>=1.24.0
-pytesseract>=0.3.10
-pillow>=10.0.0
-beautifulsoup4>=4.12.0
+# ═══════════════════════════════════════════════════════════════
+# FinSight — Financial Intelligence Platform
+# requirements.txt
+# ═══════════════════════════════════════════════════════════════
+# Install:  pip install -r requirements.txt
+# After install, download the spaCy NLP model:
+#   python -m spacy download en_core_web_lg   (best, ~550 MB)
+#   python -m spacy download en_core_web_sm   (fast,  ~12 MB)
+# ═══════════════════════════════════════════════════════════════
 
-# Embeddings & Vector Operations
-sentence-transformers>=3.0.0
-chromadb>=0.5.0
+# ── App / UI ──────────────────────────────────────────────────
+streamlit>=1.35.0
+
+# ── Document Parsing & HTML Processing ───────────────────────
+pymupdf>=1.24.0              # PDF parsing (fitz)
+pytesseract>=0.3.10          # OCR fallback for scanned PDFs
+pillow>=10.0.0               # Image handling
+beautifulsoup4>=4.12.0       # HTML/XBRL parsing
+lxml>=5.0.0                  # Fast XML/HTML parser
+
+# ── Embeddings & Vector Store ─────────────────────────────────
+sentence-transformers>=3.0.0 # BAAI/bge-small-en-v1.5 embeddings
+chromadb>=0.5.0              # Local vector database
+
+# ── PostgreSQL / XBRL structured data ────────────────────────
+psycopg2-binary>=2.9.0       # PostgreSQL adapter
+sqlalchemy>=2.0.0            # ORM for schema management
+
+# ── Visualisation ─────────────────────────────────────────────
+plotly>=7.0.0                # Interactive financial charts
+
+# ── LLM Generation ────────────────────────────────────────────
+groq>=0.9.0                  # Groq LLM API client
+
+# ── Environment ───────────────────────────────────────────────
+python-dotenv>=1.0.0         # .env file loader
 
 
-# XBRL parsing — uses lxml directly (python-xbrl incompatible with marshmallow 4.x on Python 3.13)
-# lxml is pulled in automatically as a transitive dependency (beautifulsoup4, chromadb)
-
-# PostgreSQL
-psycopg2-binary>=2.9.0      # PostgreSQL adapter
-plotly>=7.0.0               # Interactive charts for dashboard
-sqlalchemy>=2.0.0           # ORM for schema management
-
-
-# LLM Generation & Environment
-groq>=0.9.0
-python-dotenv>=1.0.0
-
-
-# App & Environment
-streamlit
+# ══════════════════════════════════════════════════════════════
+#  PRIVACY / PII REDACTION  (privacy/ package)
+# ══════════════════════════════════════════════════════════════
+#
+#  Two-layer pipeline  (privacy/redactor.py):
+#
+#  Layer 1 — Presidio NLP  (optional, lazy-loaded)
+#    • Open-source MIT, backed by Microsoft
+#    • 50+ entity types: names, emails, SSNs, credit cards,
+#      IBANs, bank numbers, passports, driver's licences
+#    • Uses spaCy as NLP backend
+#    • Falls back silently if not installed — app never breaks
+#
+#  Layer 2 — Regex  (always active, zero dependencies)
+#    • Catches financial IDs NLP misses: EINs, ABA routing
+#      numbers, internal account refs, precise card/SSN formats
+#
+presidio-analyzer>=2.2.0
+presidio-anonymizer>=2.2.0
+spacy>=3.7.0

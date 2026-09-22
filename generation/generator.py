@@ -1,5 +1,6 @@
 import os
 import time
+import logging
 from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional
@@ -43,6 +44,64 @@ class RAGGenerator:
     else:
       self.xbrl_retriever = None
 
+  # Models tried in order when the primary is at capacity (503/429)
+  _FALLBACK_MODELS = [
+      "llama-3.3-70b-versatile",
+      "llama-3.1-8b-instant",
+      "gemma2-9b-it",
+  ]
+
+  def _call_llm(
+      self,
+      messages: list,
+      temperature: float = 0.1,
+      max_retries: int = 3,
+  ) -> str:
+      """
+      Wraps client.chat.completions.create with:
+      • Exponential-backoff retry (3 attempts, 2s / 4s / 8s)
+      • Automatic fallback to alternative models on 503 / 429
+
+      Returns the final answer string.
+      """
+      models_to_try = [self.model_name] + [
+          m for m in self._FALLBACK_MODELS if m != self.model_name
+      ]
+
+      last_exc = None
+      for model in models_to_try:
+          for attempt in range(max_retries):
+              try:
+                  resp = self.client.chat.completions.create(
+                      model=model,
+                      messages=messages,
+                      temperature=temperature,
+                  )
+                  content = resp.choices[0].message.content
+                  if model != self.model_name:
+                      logging.getLogger(__name__).warning(
+                          f"[Generator] Primary model '{self.model_name}' unavailable — "
+                          f"used fallback '{model}' (attempt {attempt+1})"
+                      )
+                  return content or ""
+              except Exception as exc:
+                  last_exc = exc
+                  err_str = str(exc).lower()
+                  is_capacity = any(code in err_str for code in ["503", "429", "capacity", "overloaded", "rate"])
+                  if is_capacity and attempt < max_retries - 1:
+                      wait = 2 ** (attempt + 1)   # 2s, 4s, 8s
+                      logging.getLogger(__name__).warning(
+                          f"[Generator] {model} returned capacity error — retrying in {wait}s "
+                          f"(attempt {attempt+1}/{max_retries})"
+                      )
+                      time.sleep(wait)
+                  else:
+                      break   # non-capacity error or exhausted retries → try next model
+
+      raise RuntimeError(
+          f"All models exhausted. Last error: {last_exc}"
+      )
+
   def format_context(self, retrieved_chunks: List[Dict[str, Any]]) -> str:
     """Formats retrieved chunks with citations into a unified context block."""
     context_parts = []
@@ -55,14 +114,21 @@ class RAGGenerator:
       )
     return "\n\n".join(context_parts)
 
-  def _get_xbrl_context(self, ticker: Optional[str], fiscal_period: Optional[str] = None) -> str:
+  def _get_xbrl_context(
+      self,
+      ticker: Optional[str],
+      fiscal_period: Optional[str] = None,
+      query: Optional[str] = None,
+  ) -> str:
     """Fetch structured XBRL facts from PostgreSQL as a formatted text block.
     Returns empty string if XBRL retriever is unavailable or ticker is None.
     """
     if not self.xbrl_retriever or not ticker:
       return ""
     try:
-      return self.xbrl_retriever.to_context_string(ticker=ticker, fiscal_period=fiscal_period)
+      return self.xbrl_retriever.to_context_string(
+          ticker=ticker, fiscal_period=fiscal_period, query=query
+      )
     except Exception:
       return ""
 
@@ -93,8 +159,42 @@ class RAGGenerator:
     context = self.format_context(chunks)
     similarity_scores = [c["similarity_score"] for c in chunks]
 
+    # --- Auto-detect ticker from query or top chunk if not explicitly provided ---
+    active_ticker = ticker
+    if not active_ticker:
+        q_lower = query.lower()
+        company_hints = {
+            "boeing": "BA", " ba ": "BA",
+            "jpmorgan": "JPM", "jp morgan": "JPM", "jpmc": "JPM", " jpm ": "JPM",
+            "tesla": "TSLA", " tsla ": "TSLA",
+            "apple": "AAPL", " aapl ": "AAPL",
+            "microsoft": "MSFT", " msft ": "MSFT",
+            "google": "GOOGL", "alphabet": "GOOGL", " googl ": "GOOGL",
+            "amazon": "AMZN", " amzn ": "AMZN",
+            "nvidia": "NVDA", " nvda ": "NVDA",
+        }
+        for hint, t_code in company_hints.items():
+            if hint in q_lower:
+                active_ticker = t_code
+                break
+        
+        # Fallback to top retrieved chunk's paper_id
+        if not active_ticker and chunks:
+            top_paper = chunks[0]["metadata"].get("paper_id", "").lower()
+            for hint, t_code in company_hints.items():
+                if hint.strip() in top_paper:
+                    active_ticker = t_code
+                    break
+            if not active_ticker:
+                import re
+                m = re.match(r"^([a-zA-Z]+)", top_paper)
+                if m and len(m.group(1)) <= 5:
+                    active_ticker = m.group(1).upper()
+
     # --- Structured XBRL facts from PostgreSQL (prepended for grounding) ---
-    xbrl_block = self._get_xbrl_context(ticker=ticker, fiscal_period=fiscal_period)
+    xbrl_block = self._get_xbrl_context(
+        ticker=active_ticker, fiscal_period=fiscal_period, query=query
+    )
     xbrl_section = f"{xbrl_block}\n\n" if xbrl_block else ""
 
     system_prompt = (
@@ -117,16 +217,16 @@ ANALYST RESPONSE:"""
 
     # --- LLM call with timing ---
     with Timer() as llm_timer:
-      response = self.client.chat.completions.create(
-          model=self.model_name,
+      answer = self._call_llm(
           messages=[
               {"role": "system", "content": system_prompt},
-              {"role": "user", "content": user_prompt},
+              {"role": "user",   "content": user_prompt},
           ],
           temperature=0.1,
       )
 
-    answer = response.choices[0].message.content
+    if not answer or not answer.strip():
+        answer = "I was unable to generate a response. Please try rephrasing your question or check that the correct document is selected."
     total_ms = (time.perf_counter() - total_start) * 1000
 
     # --- Log the query ---
@@ -195,16 +295,13 @@ ANALYST RESPONSE:"""
 Generate the Standard Financial Analysis Report now."""
 
     with Timer() as llm_timer:
-      response = self.client.chat.completions.create(
-          model=self.model_name,
+      answer = self._call_llm(
           messages=[
               {"role": "system", "content": system_prompt},
-              {"role": "user", "content": user_prompt},
+              {"role": "user",   "content": user_prompt},
           ],
           temperature=0.2,
       )
-
-    answer = response.choices[0].message.content
     total_ms = (time.perf_counter() - total_start) * 1000
 
     log_query(

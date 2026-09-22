@@ -15,6 +15,16 @@ def extract_html_text(html_path: str) -> str:
 
     soup = BeautifulSoup(html_content, "html.parser")
 
+    # Detect SEC iFrame / ixViewer interactive wrapper stubs
+    if "XBRL Viewer" in html_content or "loadViewer" in html_content:
+        # Check if this is just the 6KB wrapper
+        visible_text = soup.get_text(separator=" ").strip()
+        if len(visible_text.split()) < 100:
+            raise ValueError(
+                "Uploaded file is an SEC Interactive Viewer wrapper (6 KB) rather than the actual 10-K report text. "
+                "On SEC EDGAR, please open the primary document (.htm) directly (or right-click 'Open Document' -> Save Link As) and upload that full file."
+            )
+
     # Remove script, style, noscript, svg elements
     for element in soup(["script", "style", "noscript", "svg", "iframe"]):
         element.decompose()
@@ -26,6 +36,12 @@ def extract_html_text(html_path: str) -> str:
     lines = [line.strip() for line in text.splitlines()]
     clean_lines = [line for line in lines if line]
     clean_text = "\n".join(clean_lines)
+
+    if len(clean_text.split()) < 20:
+        raise ValueError(
+            "Uploaded HTML file contains almost no text (less than 20 words). "
+            "Please ensure you uploaded the full financial report rather than a stub/link page."
+        )
 
     return clean_text
 

@@ -1,0 +1,32 @@
+# .gitattributes — Normalise line endings across OS
+# Prevents the LF→CRLF warnings on Windows and diff noise on cross-platform teams.
+
+# Default: normalise all text files to LF in the repo
+* text=auto eol=lf
+
+# Python source
+*.py    text eol=lf
+
+# Config / docs
+*.md    text eol=lf
+*.txt   text eol=lf
+*.toml  text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.json  text eol=lf
+*.env   text eol=lf
+
+# Shell / PowerShell
+*.sh    text eol=lf
+*.ps1   text eol=crlf
+
+# Binary — never diff or convert
+*.pdf   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.whl   binary
+*.pyd   binary
+*.so    binary

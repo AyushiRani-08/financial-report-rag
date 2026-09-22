@@ -1,4 +1,20 @@
-# Virtual Environments
+# FinSight — .gitignore
+# ══════════════════════════════════════════════════════════════
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.whl
+*.spec
+
+# ── Virtual environments ──────────────────────────────────────
 venv/
 .venv/
 env/
@@ -6,49 +22,64 @@ ENV/
 env_new/
 .Python
 
-# Byte-code / Cache
-__pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-
-# Environment Variables & Secrets
+# ── Environment & Secrets ─────────────────────────────────────
 .env
 .env.local
 .env.*.local
 .streamlit/secrets.toml
 
-# Project Data & Vector Stores
+# ── Project data (large / generated / sensitive) ──────────────
+# Raw filing downloads (can be large — 50-200 MB per filing)
 data/raw_pdfs/*
 !data/raw_pdfs/.gitkeep
+
+# Parsed text output
 data/parsed/*
 !data/parsed/.gitkeep
+
+# XBRL intermediate files
 data/xbrl/*
 !data/xbrl/.gitkeep
+
+# Vector store (ChromaDB — hundreds of MBs, machine-specific)
+data/chroma_db/
+
+# Legacy index formats
 data/bm25.pkl
 data/qdrant_storage/
-data/chroma_db/
+
+# Downloaded SEC filings (HTML/HTM are usually huge)
 *.html
 *.htm
+
+# ── Logs & audit trails ───────────────────────────────────────
+# Keep the directory tracked but not the log files themselves
+logs/*
+!logs/.gitkeep
+
+# ── Evaluation results ────────────────────────────────────────
+# Individual run JSONs are machine-generated — don't commit them
+eval/results/*
+!eval/results/.gitkeep
+
+# ── Database files ────────────────────────────────────────────
 *.sqlite3
 *.db
 
-# Streamlit Cache
+# ── Streamlit cache ───────────────────────────────────────────
 .streamlit/*.sqlite3
 
-# Logs & Docker
-logs/
-*.log
-*.jsonl
+# ── Docker overrides ─────────────────────────────────────────
 docker-compose.override.yml
 
-# IDE & OS Metadata
+# ── IDE & OS metadata ─────────────────────────────────────────
 .vscode/
 .idea/
+*.code-workspace
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# Deployment Platforms
+# ── Deployment platforms ──────────────────────────────────────
 .railway/
 .fly/
