@@ -12,6 +12,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from retrieval.retriever import Retriever
 from retrieval.xbrl_retriever import XBRLRetriever
 from utils.logger import log_query, Timer
+from utils.metadata_parser import parse_filing_metadata, COMPANY_TICKER_MAP
 
 load_dotenv()
 
@@ -135,13 +136,69 @@ class RAGGenerator:
   def generate_answer(
       self, query: str, top_k: int = 3, paper_id=None,
       ticker: Optional[str] = None, fiscal_period: Optional[str] = None,
+      session_id: Optional[str] = None,
   ) -> Dict[str, Any]:
     """Retrieves relevant chunks and generates a grounded response with page citations."""
     total_start = time.perf_counter()
 
-    # --- Retrieval with timing ---
+    # --- Pre-Retrieval Scope Resolution (Retrieval Isolation) ---
+    active_ticker = ticker
+    active_period = fiscal_period
+
+    if paper_id:
+        inferred = parse_filing_metadata(paper_id)
+        if not active_ticker:
+            active_ticker = inferred.get("ticker")
+        if not active_period:
+            active_period = inferred.get("fiscal_period")
+
+    if not active_ticker:
+        q_lower = query.lower()
+        company_hints = {
+            "boeing": "BA", " ba ": "BA",
+            "jpmorgan": "JPM", "jp morgan": "JPM", "jpmc": "JPM", " jpm ": "JPM",
+            "tesla": "TSLA", " tsla ": "TSLA",
+            "apple": "AAPL", " aapl ": "AAPL",
+            "microsoft": "MSFT", " msft ": "MSFT",
+            "google": "GOOGL", "alphabet": "GOOGL", " googl ": "GOOGL",
+            "amazon": "AMZN", " amzn ": "AMZN",
+            "nvidia": "NVDA", " nvda ": "NVDA",
+        }
+        for hint, t_code in company_hints.items():
+            if hint in q_lower:
+                active_ticker = t_code
+                break
+
+    if not active_period:
+        import re
+        fy_match = re.search(r'\b(fy\s*20\d\d|20\d\d|q[1-4]\s*fy\s*20\d\d)\b', query.lower())
+        if fy_match:
+            raw_period = fy_match.group(1).replace(" ", "").upper()
+            if raw_period.isdigit():
+                active_period = f"FY{raw_period}"
+            else:
+                active_period = raw_period
+
+    # --- Isolated Retrieval with timing ---
     with Timer() as retrieval_timer:
-      chunks = self.retriever.retrieve(query=query, top_k=top_k, paper_id=paper_id)
+      chunks = self.retriever.retrieve(
+          query=query,
+          top_k=top_k,
+          paper_id=paper_id,
+          ticker=active_ticker,
+          fiscal_period=active_period,
+          session_id=session_id,
+      )
+
+    # Graceful fallback: if strictly isolated search yielded 0 results, relax period or ticker
+    if not chunks and active_ticker and not paper_id:
+        with Timer() as retrieval_timer:
+            chunks = self.retriever.retrieve(
+                query=query,
+                top_k=top_k,
+                paper_id=None,
+                session_id=session_id,
+            )
 
     if not chunks:
       log_query(
@@ -159,41 +216,15 @@ class RAGGenerator:
     context = self.format_context(chunks)
     similarity_scores = [c["similarity_score"] for c in chunks]
 
-    # --- Auto-detect ticker from query or top chunk if not explicitly provided ---
-    active_ticker = ticker
-    if not active_ticker:
-        q_lower = query.lower()
-        company_hints = {
-            "boeing": "BA", " ba ": "BA",
-            "jpmorgan": "JPM", "jp morgan": "JPM", "jpmc": "JPM", " jpm ": "JPM",
-            "tesla": "TSLA", " tsla ": "TSLA",
-            "apple": "AAPL", " aapl ": "AAPL",
-            "microsoft": "MSFT", " msft ": "MSFT",
-            "google": "GOOGL", "alphabet": "GOOGL", " googl ": "GOOGL",
-            "amazon": "AMZN", " amzn ": "AMZN",
-            "nvidia": "NVDA", " nvda ": "NVDA",
-        }
-        for hint, t_code in company_hints.items():
-            if hint in q_lower:
-                active_ticker = t_code
-                break
-        
-        # Fallback to top retrieved chunk's paper_id
-        if not active_ticker and chunks:
-            top_paper = chunks[0]["metadata"].get("paper_id", "").lower()
-            for hint, t_code in company_hints.items():
-                if hint.strip() in top_paper:
-                    active_ticker = t_code
-                    break
-            if not active_ticker:
-                import re
-                m = re.match(r"^([a-zA-Z]+)", top_paper)
-                if m and len(m.group(1)) <= 5:
-                    active_ticker = m.group(1).upper()
+    # If active_ticker wasn't determined beforehand, try inferring from top retrieved chunk
+    if not active_ticker and chunks:
+        top_paper = chunks[0]["metadata"].get("paper_id", "")
+        inferred = parse_filing_metadata(top_paper)
+        active_ticker = inferred.get("ticker")
 
     # --- Structured XBRL facts from PostgreSQL (prepended for grounding) ---
     xbrl_block = self._get_xbrl_context(
-        ticker=active_ticker, fiscal_period=fiscal_period, query=query
+        ticker=active_ticker, fiscal_period=active_period, query=query
     )
     xbrl_section = f"{xbrl_block}\n\n" if xbrl_block else ""
 
@@ -244,9 +275,19 @@ ANALYST RESPONSE:"""
   def generate_standard_report(
       self, paper_id=None,
       ticker: Optional[str] = None, fiscal_period: Optional[str] = None,
+      session_id: Optional[str] = None,
   ) -> Dict[str, Any]:
     """Generates a comprehensive 5-part standard retail investor financial report."""
     total_start = time.perf_counter()
+
+    active_ticker = ticker
+    active_period = fiscal_period
+    if paper_id:
+        inferred = parse_filing_metadata(paper_id)
+        if not active_ticker:
+            active_ticker = inferred.get("ticker")
+        if not active_period:
+            active_period = inferred.get("fiscal_period")
 
     report_query = (
         "Provide a comprehensive financial summary including revenue growth, net income, "
@@ -254,7 +295,14 @@ ANALYST RESPONSE:"""
     )
 
     with Timer() as retrieval_timer:
-      chunks = self.retriever.retrieve(query=report_query, top_k=6, paper_id=paper_id)
+      chunks = self.retriever.retrieve(
+          query=report_query,
+          top_k=6,
+          paper_id=paper_id,
+          ticker=active_ticker,
+          fiscal_period=active_period,
+          session_id=session_id,
+      )
 
     if not chunks:
       log_query(

@@ -336,6 +336,7 @@ Items ordered by estimated impact:
 ### High Impact
 - [x] **Expand `CANONICAL_MAP`** in `ingestion/xbrl_parser.py` — added 40+ US-GAAP tags covering CapEx, share repurchases, dividends, OpEx, R&D, SG&A, depreciation/amortization, taxes, working capital, and comprehensive balance sheet items. *(Sept 2026)*
 - [x] **Clean the `papers` collection** — deleted 54 junk chunks (resumes, ML papers, personal docs). Collection: 126 → 78 chunks. Remaining: `aapl-20250927` (72) + `stock-market-fundamentals` (6). *(Sept 2026)*
+- [x] **Retrieval Isolation & Pre-Search Routing** — multi-attribute metadata isolation (`ticker`, `fiscal_period`, `form_type`, `session_id`) using ChromaDB compound `$and` filters and automated query intent routing to eliminate cross-company and cross-period contamination. *(Sept 2026)*
 - [ ] **Index more filings** — current corpus is 126 chunks from 2 Apple HTML filings. Add 10-K filings for multiple companies and years. Retrieval quality scales with corpus breadth.
 
 ### Medium Impact

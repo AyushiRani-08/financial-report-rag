@@ -409,8 +409,17 @@ with st.sidebar:
                         st.session_state["auto_ticker"] = auto_ticker
                         st.session_state["auto_period"] = auto_period
                     st.rerun()
+                except ValueError as ve:
+                    st.error(f"❌ Upload failed: {ve}")
+                    st.info(
+                        "💡 **How to get the correct file from SEC EDGAR:**\n"
+                        "1. Go to [SEC EDGAR](https://www.sec.gov/cgi-bin/browse-edgar) and search your company.\n"
+                        "2. Click the **10-K** or **10-Q** filing row.\n"
+                        "3. In the filing index, click the **primary document** (the largest `.htm` file — NOT the viewer/iXBRL link).\n"
+                        "4. Right-click the page → **Save As** → upload that saved file here."
+                    )
                 except Exception as e:
-                    st.error(f"Indexing failed: {e}")
+                    st.error(f"❌ Indexing failed: {e}")
                     st.exception(e)
 
 
@@ -741,16 +750,29 @@ with col_att1:
             
             if st.button("⚡ Index & Chat with File", use_container_width=True, key="btn_index_inline"):
                 with st.spinner(f"Indexing `{clean_name}` into vector store..."):
-                    c_count = vector_store.add_document(str(save_path))
-                    st.cache_data.clear()
-                    st.cache_resource.clear()
-                    doc_stem = Path(clean_name).stem
-                    st.session_state["attached_doc"] = doc_stem
-                    auto_t, auto_p = _parse_ticker_and_period(doc_stem)
-                    if auto_t:
-                        st.session_state["auto_ticker"] = auto_t
-                    st.success(f"✅ Ready! `{clean_name}` ({c_count} chunks indexed).")
-                    st.rerun()
+                    try:
+                        c_count = vector_store.add_document(str(save_path))
+                        st.cache_data.clear()
+                        st.cache_resource.clear()
+                        doc_stem = Path(clean_name).stem
+                        st.session_state["attached_doc"] = doc_stem
+                        auto_t, auto_p = _parse_ticker_and_period(doc_stem)
+                        if auto_t:
+                            st.session_state["auto_ticker"] = auto_t
+                        st.success(f"✅ Ready! `{clean_name}` ({c_count} chunks indexed).")
+                        st.rerun()
+                    except ValueError as ve:
+                        st.error(f"❌ Upload failed: {ve}")
+                        st.info(
+                            "💡 **How to get the correct file from SEC EDGAR:**\n"
+                            "1. Go to [SEC EDGAR](https://www.sec.gov/cgi-bin/browse-edgar) and search your company.\n"
+                            "2. Click the **10-K** or **10-Q** filing row.\n"
+                            "3. In the filing index, click the **primary document** (usually the largest `.htm` file, NOT the viewer link).\n"
+                            "4. Right-click the page → **Save As** → upload that file here."
+                        )
+                    except Exception as e:
+                        st.error(f"❌ Indexing error: {e}")
+                        st.exception(e)
 
 with col_att2:
     if active_attached_doc:

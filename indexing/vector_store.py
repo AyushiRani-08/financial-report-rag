@@ -8,6 +8,8 @@ import chromadb
 from ingestion.pdf_parser import chunk_pdf
 from ingestion.html_parser import chunk_html
 from indexing.embedder import Embedder
+from utils.metadata_parser import parse_filing_metadata
+from typing import Optional
 
 # Privacy: redact PII from chunks before they are embedded and stored.
 # Gracefully no-ops if the privacy package is not importable.
@@ -36,21 +38,20 @@ class VectorStore:
         )
         self.embedder = Embedder()
 
-    def add_document(self, file_path: str) -> int:
+    def add_document(
+        self,
+        file_path: str,
+        paper_id: Optional[str] = None,
+        ticker: Optional[str] = None,
+        fiscal_period: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> int:
         """
-        Chunks, redacts PII, embeds, and stores a financial document.
-
-        Full pipeline per chunk
-        ───────────────────────
-          raw file → parse → chunk → redact_chunk() → embed → ChromaDB
-
-        ChromaDB and the LLM only ever see sanitised text.
-        Every redaction event is written to logs/redactions.log.
-
-        Returns the number of stored chunks.
+        Chunks, redacts PII, embeds, and stores a financial document with
+        metadata tags for retrieval isolation (ticker, period, form, session).
         """
         path_obj = Path(file_path)
-        paper_id = path_obj.stem
+        paper_id = paper_id or path_obj.stem
         ext = path_obj.suffix.lower()
 
         # ── 1. Parse & chunk ─────────────────────────────────────────────────
@@ -92,15 +93,25 @@ class VectorStore:
 
         # ── 4. Store in ChromaDB ──────────────────────────────────────────────
         print("4. Storing in ChromaDB...")
+        inferred = parse_filing_metadata(paper_id)
+        final_ticker = ticker or inferred.get("ticker") or ""
+        final_period = fiscal_period or inferred.get("fiscal_period") or ""
+        form_type = inferred.get("form_type") or ""
+        final_session = session_id or "global"
+
         ids        = [f"{paper_id}_chunk_{c['chunk_id']}" for c in embedded_chunks]
         documents  = [c["text"] for c in embedded_chunks]
         embeddings = [c["embedding"].tolist() for c in embedded_chunks]
         metadatas  = [
             {
-                "paper_id":    paper_id,
-                "page_number": c["page_number"],
-                "word_count":  c["word_count"],
-                "file_type":   ext.lstrip("."),
+                "paper_id":      paper_id,
+                "ticker":        final_ticker,
+                "fiscal_period": final_period,
+                "form_type":     form_type,
+                "session_id":    final_session,
+                "page_number":   c["page_number"],
+                "word_count":    c["word_count"],
+                "file_type":     ext.lstrip("."),
             }
             for c in embedded_chunks
         ]
@@ -111,8 +122,46 @@ class VectorStore:
             embeddings=embeddings,
             metadatas=metadatas,
         )
-        print(f"[OK] Stored {len(embedded_chunks)} chunks for '{paper_id}'.")
+        print(f"[OK] Stored {len(embedded_chunks)} chunks for '{paper_id}' (Ticker: {final_ticker or 'N/A'}, Period: {final_period or 'N/A'}).")
         return len(embedded_chunks)
+
+    def backfill_isolation_metadata(self) -> int:
+        """
+        Backfills existing chunks in ChromaDB with 'ticker', 'fiscal_period',
+        'form_type', and 'session_id' based on their 'paper_id'.
+        Returns count of updated chunks.
+        """
+        data = self.collection.get(include=["metadatas"])
+        if not data or not data.get("ids"):
+            return 0
+        ids = data["ids"]
+        metas = data["metadatas"]
+        updated_metas = []
+        changed = 0
+        for m in metas:
+            meta = dict(m) if m else {}
+            pid = meta.get("paper_id", "")
+            inferred = parse_filing_metadata(pid)
+            new_ticker = meta.get("ticker") or inferred.get("ticker") or ""
+            new_period = meta.get("fiscal_period") or inferred.get("fiscal_period") or ""
+            new_form = meta.get("form_type") or inferred.get("form_type") or ""
+            new_session = meta.get("session_id") or "global"
+            if (
+                meta.get("ticker") != new_ticker
+                or meta.get("fiscal_period") != new_period
+                or meta.get("form_type") != new_form
+                or meta.get("session_id") != new_session
+            ):
+                changed += 1
+            meta["ticker"] = new_ticker
+            meta["fiscal_period"] = new_period
+            meta["form_type"] = new_form
+            meta["session_id"] = new_session
+            updated_metas.append(meta)
+        if changed > 0:
+            self.collection.update(ids=ids, metadatas=updated_metas)
+            print(f"[OK] Backfilled isolation metadata for {changed} chunks.")
+        return changed
 
     def _chunk_generic_text(
         self, file_path: str, chunk_size: int = 500, overlap_pct: float = 0.10

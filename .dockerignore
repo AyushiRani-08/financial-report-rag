@@ -1,0 +1,45 @@
+# Virtual environments
+env_new/
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache & build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Version control & IDE
+.git/
+.gitignore
+.gitattributes
+.github/
+.vscode/
+.idea/
+
+# Environment files & secrets (pass via compose or docker run, do not bake into image)
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Local data & storage (persisted via Docker volumes instead of image build)
+data/chroma_db/
+data/raw_pdfs/*
+!data/raw_pdfs/.gitkeep
+data/parsed/*
+!data/parsed/.gitkeep
+data/xbrl/*
+!data/xbrl/.gitkeep
+logs/*
+!logs/.gitkeep
+eval/results/
+
+# Documentation
+ARCHITECTURE.md
+README.md

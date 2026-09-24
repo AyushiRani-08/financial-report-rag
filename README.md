@@ -47,6 +47,26 @@ Detailed documentation on the two-track architecture, data flow, embedding exper
 
 ## 🚀 Quickstart
 
+### Option A: Run with Docker Compose (Recommended)
+
+1. **Configure environment**:
+   ```bash
+   cp .env.example .env
+   # Add your GROQ_API_KEY in .env
+   ```
+
+2. **Start all services (App + PostgreSQL)**:
+   ```bash
+   docker compose up --build
+   ```
+   - Automatically initializes PostgreSQL schema from `db/schema.sql`.
+   - Access the dashboard at **`http://localhost:8080`**.
+   - PostgreSQL is also accessible at `localhost:5432`.
+
+---
+
+### Option B: Local Python Environment
+
 1. **Clone the repository**:
    ```bash
    git clone https://github.com/AyushiRani-08/paper-rag.git
@@ -62,15 +82,18 @@ Detailed documentation on the two-track architecture, data flow, embedding exper
 3. **Install dependencies**:
    ```bash
    pip install -r requirements.txt
+   python -m spacy download en_core_web_sm
    ```
 
-4. **Add environment variable**:
-   Create a `.env` file in the project root:
+4. **Add environment variables**:
+   Create a `.env` file from `.env.example`:
    ```env
    GROQ_API_KEY=your_groq_api_key_here
+   POSTGRES_DSN=postgresql://postgres:password@localhost:5432/financial_rag
    ```
 
 5. **Run the application**:
    ```bash
    streamlit run app.py
    ```
+

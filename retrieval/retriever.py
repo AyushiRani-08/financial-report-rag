@@ -29,19 +29,49 @@ class Retriever:
         query: str,
         top_k: int = 3,
         paper_id: str | None = None,
+        ticker: str | None = None,
+        fiscal_period: str | None = None,
+        form_type: str | None = None,
+        session_id: str | None = None,
+        where_override: dict | None = None,
     ) -> List[Dict[str, Any]]:
-        """Searches ChromaDB for the top_k most relevant chunks.
+        """Searches ChromaDB for the top_k most relevant chunks with strict isolation boundaries.
 
         Args:
             query: The user question.
             top_k: Number of relevant chunks to return.
-            paper_id: Optional filter to restrict search to a specific paper.
+            paper_id: Restrict search to a specific document.
+            ticker: Restrict search to a specific company ticker (e.g. 'AAPL').
+            fiscal_period: Restrict search to a specific period (e.g. 'FY2025').
+            form_type: Restrict search to a specific SEC form (e.g. '10-K', '10-Q').
+            session_id: Restrict to session-scoped documents or shared global documents.
+            where_override: Explicit ChromaDB where filter dict.
         """
         # 1. Embed query with BGE prompt formatting
         query_vector = self.embedder.embed_query(query).tolist()
 
-        # 2. Set optional metadata filter
-        where_filter = {"paper_id": paper_id} if paper_id else None
+        # 2. Build compound where filter for Retrieval Isolation
+        def _build_filter(p_id, t, fp, ft, s_id):
+            conds = []
+            if p_id:
+                conds.append({"paper_id": p_id})
+            if t:
+                conds.append({"ticker": t.upper()})
+            if fp:
+                conds.append({"fiscal_period": fp})
+            if ft:
+                conds.append({"form_type": ft})
+            if s_id and s_id != "global":
+                conds.append({"$or": [{"session_id": s_id}, {"session_id": "global"}]})
+            if len(conds) == 1:
+                return conds[0]
+            elif len(conds) > 1:
+                return {"$and": conds}
+            return None
+
+        where_filter = where_override or _build_filter(
+            paper_id, ticker, fiscal_period, form_type, session_id
+        )
 
         # 3. Query ChromaDB
         results = self.collection.query(
@@ -50,6 +80,22 @@ class Retriever:
             where=where_filter,
             include=["documents", "metadatas", "distances"],
         )
+
+        # Fallback: if period was specified but returned 0 results, fall back to ticker-level isolation
+        # to ensure user still receives company results without cross-company bleed.
+        if (
+            (not results["documents"] or not results["documents"][0])
+            and fiscal_period
+            and ticker
+            and not paper_id
+        ):
+            fallback_filter = _build_filter(paper_id, ticker, None, form_type, session_id)
+            results = self.collection.query(
+                query_embeddings=[query_vector],
+                n_results=top_k,
+                where=fallback_filter,
+                include=["documents", "metadatas", "distances"],
+            )
 
         # 4. Format outputs into a clean list of dictionaries
         retrieved_chunks = []
