@@ -17,10 +17,7 @@ from auth.session import require_auth, render_sidebar_user
 
 load_dotenv()
 
-st.set_page_config(
-    page_title="FinSight — Financial Dashboard",
-    layout="wide",
-)
+
 
 # ── Auth Gate ─────────────────────────────────────────────────────────────
 current_user = require_auth()

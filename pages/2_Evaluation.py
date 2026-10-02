@@ -12,10 +12,7 @@ import plotly.graph_objects as go
 
 from auth.session import require_auth, render_sidebar_user
 
-st.set_page_config(
-    page_title="FinSight — Evaluation and Accuracy Audit",
-    layout="wide",
-)
+
 
 # ── Auth Gate ─────────────────────────────────────────────────────────────
 current_user = require_auth()

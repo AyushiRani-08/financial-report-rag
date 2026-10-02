@@ -103,6 +103,44 @@ class RAGGenerator:
           f"All models exhausted. Last error: {last_exc}"
       )
 
+  def _call_llm_stream(
+      self,
+      messages: list,
+      temperature: float = 0.1,
+  ):
+      """
+      Streams tokens from the LLM, falling back across models on 503/429.
+      Yields string token chunks as they arrive from the Groq API.
+      """
+      models_to_try = [self.model_name] + [
+          m for m in self._FALLBACK_MODELS if m != self.model_name
+      ]
+      for model in models_to_try:
+          try:
+              stream = self.client.chat.completions.create(
+                  model=model,
+                  messages=messages,
+                  temperature=temperature,
+                  stream=True,
+              )
+              for chunk in stream:
+                  delta = chunk.choices[0].delta.content
+                  if delta:
+                      yield delta
+              return  # streaming finished successfully
+          except Exception as exc:
+              err_str = str(exc).lower()
+              is_capacity = any(
+                  c in err_str for c in ["503", "429", "capacity", "overloaded", "rate"]
+              )
+              if is_capacity:
+                  logging.getLogger(__name__).warning(
+                      f"[Generator] {model} capacity error during stream — trying next model."
+                  )
+                  continue
+              raise
+      raise RuntimeError("All models exhausted during streaming.")
+
   def format_context(self, retrieved_chunks: List[Dict[str, Any]]) -> str:
     """Formats retrieved chunks with citations into a unified context block."""
     context_parts = []
@@ -272,6 +310,109 @@ ANALYST RESPONSE:"""
 
     return {"answer": answer, "sources": chunks}
 
+  def generate_answer_stream(
+      self,
+      query: str,
+      top_k: int = 3,
+      paper_id=None,
+      ticker: Optional[str] = None,
+      fiscal_period: Optional[str] = None,
+      session_id: Optional[str] = None,
+      sources_out: Optional[list] = None,
+  ):
+      """
+      Streaming version of generate_answer.
+      Yields LLM tokens live. If sources_out is provided, it is populated
+      with the retrieved source chunks so the caller can display citations.
+      """
+      import re
+      active_ticker = ticker
+      active_period = fiscal_period
+
+      if paper_id:
+          inferred = parse_filing_metadata(paper_id)
+          if not active_ticker:
+              active_ticker = inferred.get("ticker")
+          if not active_period:
+              active_period = inferred.get("fiscal_period")
+
+      if not active_ticker:
+          q_lower = query.lower()
+          company_hints = {
+              "boeing": "BA", " ba ": "BA",
+              "jpmorgan": "JPM", "jp morgan": "JPM", "jpmc": "JPM", " jpm ": "JPM",
+              "tesla": "TSLA", " tsla ": "TSLA",
+              "apple": "AAPL", " aapl ": "AAPL",
+              "microsoft": "MSFT", " msft ": "MSFT",
+              "google": "GOOGL", "alphabet": "GOOGL", " googl ": "GOOGL",
+              "amazon": "AMZN", " amzn ": "AMZN",
+              "nvidia": "NVDA", " nvda ": "NVDA",
+          }
+          for hint, t_code in company_hints.items():
+              if hint in q_lower:
+                  active_ticker = t_code
+                  break
+
+      if not active_period:
+          fy_match = re.search(r'\b(fy\s*20\d\d|20\d\d|q[1-4]\s*fy\s*20\d\d)\b', query.lower())
+          if fy_match:
+              raw_period = fy_match.group(1).replace(" ", "").upper()
+              active_period = f"FY{raw_period}" if raw_period.isdigit() else raw_period
+
+      # Retrieval
+      chunks = self.retriever.retrieve(
+          query=query, top_k=top_k, paper_id=paper_id,
+          ticker=active_ticker, fiscal_period=active_period, session_id=session_id,
+      )
+      if not chunks and active_ticker and not paper_id:
+          chunks = self.retriever.retrieve(query=query, top_k=top_k, session_id=session_id)
+
+      if not chunks:
+          if sources_out is not None:
+              sources_out.clear()
+          yield "No relevant financial documents found in the database matching your search."
+          return
+
+      if sources_out is not None:
+          sources_out.extend(chunks)
+
+      context = self.format_context(chunks)
+
+      if not active_ticker and chunks:
+          active_ticker = parse_filing_metadata(
+              chunks[0]["metadata"].get("paper_id", "")
+          ).get("ticker")
+
+      xbrl_block = self._get_xbrl_context(
+          ticker=active_ticker, fiscal_period=active_period, query=query
+      )
+      xbrl_section = f"{xbrl_block}\n\n" if xbrl_block else ""
+
+      system_prompt = (
+          "You are an expert Senior Financial Analyst specialized in explaining corporate "
+          "financial reports (10-K, 10-Q, quarterly earnings) to retail investors.\n"
+          "Rules:\n"
+          "1. Answer clearly, accurately, and concisely using ONLY the provided CONTEXT.\n"
+          "2. If STRUCTURED FINANCIAL DATA is provided at the top, treat those figures as "
+          "ground truth — they come directly from official XBRL filings.\n"
+          "3. Explain complex financial jargon in accessible terms for retail investors.\n"
+          "4. If the context does not contain the answer, state: 'I cannot find sufficient "
+          "information in the indexed financial report.'\n"
+          "5. Always cite specific page or section numbers using [Page X] notation."
+      )
+      user_prompt = (
+          f"{xbrl_section}CONTEXT FROM FINANCIAL REPORT:\n{context}\n\n"
+          f"RETAIL INVESTOR QUESTION:\n{query}\n\nANALYST RESPONSE:"
+      )
+
+      yield from self._call_llm_stream(
+          messages=[
+              {"role": "system", "content": system_prompt},
+              {"role": "user",   "content": user_prompt},
+          ],
+          temperature=0.1,
+      )
+
   def generate_standard_report(
       self, paper_id=None,
       ticker: Optional[str] = None, fiscal_period: Optional[str] = None,
@@ -362,6 +503,76 @@ Generate the Standard Financial Analysis Report now."""
     )
 
     return {"answer": answer, "sources": chunks}
+
+  def generate_standard_report_stream(
+      self,
+      paper_id=None,
+      ticker: Optional[str] = None,
+      fiscal_period: Optional[str] = None,
+      session_id: Optional[str] = None,
+      sources_out: Optional[list] = None,
+  ):
+      """
+      Streaming version of generate_standard_report.
+      Yields LLM tokens live. Populates sources_out if provided.
+      """
+      active_ticker = ticker
+      active_period = fiscal_period
+      if paper_id:
+          inferred = parse_filing_metadata(paper_id)
+          if not active_ticker:
+              active_ticker = inferred.get("ticker")
+          if not active_period:
+              active_period = inferred.get("fiscal_period")
+
+      report_query = (
+          "Provide a comprehensive financial summary including revenue growth, net income, "
+          "profitability margins, free cash flow, major risk factors, and overall strategic guidance."
+      )
+
+      chunks = self.retriever.retrieve(
+          query=report_query, top_k=6, paper_id=paper_id,
+          ticker=active_ticker, fiscal_period=active_period, session_id=session_id,
+      )
+
+      if not chunks:
+          if sources_out is not None:
+              sources_out.clear()
+          yield "No financial documents found to generate a report. Please upload a PDF or HTML report first."
+          return
+
+      if sources_out is not None:
+          sources_out.extend(chunks)
+
+      context = self.format_context(chunks)
+      xbrl_block = self._get_xbrl_context(ticker=active_ticker, fiscal_period=active_period)
+      xbrl_section = f"{xbrl_block}\n\n" if xbrl_block else ""
+
+      system_prompt = (
+          "You are a Senior Retail Financial Analyst.\n"
+          "Generate a structured, professional Standard Financial Analysis Report formatted in clean Markdown.\n"
+          "Your report MUST include the following 5 sections:\n"
+          "### 1. Executive Summary & Core Highlights\n"
+          "### 2. Revenue & Earnings Performance\n"
+          "### 3. Balance Sheet & Cash Flow Health\n"
+          "### 4. Key Risk Factors & Market Headwinds\n"
+          "### 5. Retail Investor Takeaway\n\n"
+          "If STRUCTURED FINANCIAL DATA is provided at the top, use those exact figures in "
+          "sections 2 and 3 — they are verified XBRL values from official filings.\n"
+          "Base all other statements strictly on the provided CONTEXT and cite pages/sections as [Page X]."
+      )
+      user_prompt = (
+          f"{xbrl_section}CONTEXT FROM FINANCIAL FILING:\n{context}\n\n"
+          "Generate the Standard Financial Analysis Report now."
+      )
+
+      yield from self._call_llm_stream(
+          messages=[
+              {"role": "system", "content": system_prompt},
+              {"role": "user",   "content": user_prompt},
+          ],
+          temperature=0.2,
+      )
 
 
 if __name__ == "__main__":
