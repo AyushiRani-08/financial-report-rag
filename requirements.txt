@@ -11,6 +11,9 @@
 # ── App / UI ──────────────────────────────────────────────────
 streamlit>=1.35.0
 
+# ── Supabase (Auth + Storage + pgvector) ──────────────────────
+supabase>=2.0.0
+
 # ── Document Parsing & HTML Processing ───────────────────────
 pymupdf>=1.24.0              # PDF parsing (fitz)
 pytesseract>=0.3.10          # OCR fallback for scanned PDFs
@@ -20,7 +23,7 @@ lxml>=5.0.0                  # Fast XML/HTML parser
 
 # ── Embeddings & Vector Store ─────────────────────────────────
 sentence-transformers>=3.0.0 # BAAI/bge-small-en-v1.5 embeddings
-chromadb>=0.5.0              # Local vector database
+chromadb>=0.5.0              # Local vector database (local dev only; pgvector used in production)
 
 # ── PostgreSQL / XBRL structured data ────────────────────────
 psycopg2-binary>=2.9.0       # PostgreSQL adapter

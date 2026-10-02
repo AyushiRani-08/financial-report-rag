@@ -25,12 +25,12 @@ def get_redaction_summary(findings: list[dict]) -> str | None:
     """
     Human-readable badge string for UI display, or None if nothing was redacted.
 
-    Example: "🔒 Privacy layer active — redacted: SSN ×1 [presidio], EMAIL ×1 [regex]"
+    Example: "Privacy Shield Active — Redacted: SSN ×1 [presidio], EMAIL ×1 [regex]"
     """
     if not findings:
         return None
     parts = [f"{f['entity_type']} ×{f['count']} [{f['method']}]" for f in findings]
-    return "\U0001f512 Privacy layer active \u2014 redacted: " + ", ".join(parts)
+    return "Privacy Shield Active — Redacted: " + ", ".join(parts)
 
 
 def get_engine_status() -> dict:
