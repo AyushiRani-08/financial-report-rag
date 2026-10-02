@@ -60,9 +60,11 @@ class XBRLRetriever:
 
     @property
     def conn(self) -> psycopg2.extensions.connection:
-        """Lazy connection with auto-reconnect."""
+        """Lazy connection with auto-reconnect and transaction rollback on error."""
         if self._conn is None or self._conn.closed:
             self._conn = psycopg2.connect(self.dsn)
+        elif self._conn.get_transaction_status() == psycopg2.extensions.TRANSACTION_STATUS_INERROR:
+            self._conn.rollback()
         return self._conn
 
     def close(self):
@@ -147,32 +149,47 @@ class XBRLRetriever:
             ORDER BY fi.fiscal_period DESC, ff.canonical_field
         """
 
-        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(query, params)
-            return [dict(row) for row in cur.fetchall()]
+        try:
+            with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(query, params)
+                return [dict(row) for row in cur.fetchall()]
+        except Exception:
+            if self._conn and not self._conn.closed:
+                self._conn.rollback()
+            raise
 
     def get_available_periods(self, ticker: str) -> list[str]:
         """Return all fiscal periods available for a ticker, newest first."""
-        with self.conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT DISTINCT fi.fiscal_period
-                FROM filings fi
-                JOIN companies c ON c.company_id = fi.company_id
-                WHERE c.ticker = %s
-                ORDER BY fi.fiscal_period DESC
-                """,
-                (ticker,),
-            )
-            return [row[0] for row in cur.fetchall()]
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT DISTINCT fi.fiscal_period
+                    FROM filings fi
+                    JOIN companies c ON c.company_id = fi.company_id
+                    WHERE c.ticker = %s
+                    ORDER BY fi.fiscal_period DESC
+                    """,
+                    (ticker,),
+                )
+                return [row[0] for row in cur.fetchall()]
+        except Exception:
+            if self._conn and not self._conn.closed:
+                self._conn.rollback()
+            raise
 
     def get_available_tickers(self) -> list[dict]:
         """Return all indexed companies with their market and sector."""
-        with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                "SELECT ticker, name, market, sector FROM companies ORDER BY ticker"
-            )
-            return [dict(row) for row in cur.fetchall()]
+        try:
+            with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT ticker, name, market, sector FROM companies ORDER BY ticker"
+                )
+                return [dict(row) for row in cur.fetchall()]
+        except Exception:
+            if self._conn and not self._conn.closed:
+                self._conn.rollback()
+            raise
 
     # ------------------------------------------------------------------
     # RAG context formatting
