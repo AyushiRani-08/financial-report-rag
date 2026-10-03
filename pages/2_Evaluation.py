@@ -154,10 +154,13 @@ if not RESULTS_DIR.exists():
     st.info("No evaluation runs found. Run `python eval/run_eval_50.py` to generate results.")
     st.stop()
 
-# Support both old eval_*.json and new eval50_*.json files
-result_files = sorted(list(RESULTS_DIR.glob("eval*.json")), reverse=True)
+# Prioritize new eval50_*.json benchmark runs, followed by legacy eval_*.json
+eval50_files = sorted(list(RESULTS_DIR.glob("eval50_*.json")), reverse=True)
+legacy_files = sorted([p for p in RESULTS_DIR.glob("eval*.json") if not p.name.startswith("eval50_")], reverse=True)
+result_files = eval50_files + legacy_files
+
 if not result_files:
-    st.info("No evaluation JSON files found in `eval/results/`.")
+    st.info("No evaluation JSON files found in `eval/results/`. Run `python eval/run_eval_50.py` to generate results.")
     st.stop()
 
 col_sel, col_meta = st.columns([2, 3])
@@ -165,7 +168,7 @@ with col_sel:
     selected_file = st.selectbox(
         "📂 Select Evaluation Run",
         result_files,
-        format_func=lambda p: f"{p.name}  ({p.stat().st_size // 1024} KB)",
+        format_func=lambda p: f"{'⭐ (50-Q Suite) ' if p.name.startswith('eval50_') else '📄 (Legacy) '}{p.name}  ({max(1, p.stat().st_size // 1024)} KB)",
     )
 
 with open(selected_file, "r", encoding="utf-8") as f:
@@ -173,6 +176,8 @@ with open(selected_file, "r", encoding="utf-8") as f:
 
 results    = eval_data.get("results", [])
 summary    = eval_data.get("summary", {})
+if not selected_file.name.startswith("eval50_"):
+    st.info("💡 You are viewing a legacy evaluation file. Run `python eval/run_eval_50.py` to produce a full 5-dimension report on the 50 Golden Questions.")
 timestamp  = eval_data.get("run_timestamp", "Unknown")
 model_name = eval_data.get("model", "Unknown")
 
@@ -287,11 +292,11 @@ st.divider()
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("### 🗺️ Accuracy Heatmap — Category × Dimension")
 
-cats_in_data = list(dict.fromkeys(r["category"] for r in results))
+cats_in_data = list(dict.fromkeys(r.get("category", r.get("mode", "general")) for r in results))
 heatmap_rows = []
 for cat in cats_in_data:
-    cat_results = [r for r in results if r["category"] == cat]
-    row = {"Category": CATEGORY_LABELS.get(cat, cat)}
+    cat_results = [r for r in results if r.get("category", r.get("mode", "general")) == cat]
+    row = {"Category": CATEGORY_LABELS.get(cat, cat.replace("_", " ").title())}
     for dim_key, dim_label, _ in DIMENSIONS:
         applicable = [r.get(dim_key) for r in cat_results if r.get(dim_key) is not None]
         row[dim_label] = round(100 * sum(1 for v in applicable if v is True) / len(applicable), 1) if applicable else None
@@ -330,9 +335,9 @@ st.markdown("### 📋 Pass Rate by Question Category")
 
 bar_data = []
 for cat in cats_in_data:
-    cat_results = [r for r in results if r["category"] == cat]
-    cat_pct     = pct([r.get("overall_pass") for r in cat_results])
-    bar_data.append({"Category": CATEGORY_LABELS.get(cat, cat), "Pass Rate (%)": cat_pct, "N": len(cat_results)})
+    cat_results = [r for r in results if r.get("category", r.get("mode", "general")) == cat]
+    cat_pct     = pct([r.get("overall_pass", r.get("passed")) for r in cat_results])
+    bar_data.append({"Category": CATEGORY_LABELS.get(cat, cat.replace("_", " ").title()), "Pass Rate (%)": cat_pct, "N": len(cat_results)})
 
 df_bar = pd.DataFrame(bar_data).sort_values("Pass Rate (%)", ascending=True)
 fig_bar = px.bar(
@@ -423,8 +428,8 @@ filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
 with filter_col1:
     show_only = st.selectbox("Show", ["All", "PASS only", "FAIL only", "Abstention cases", "Hallucination cases"])
 with filter_col2:
-    cat_options = ["All"] + list(dict.fromkeys(r["category"] for r in results))
-    cat_filter  = st.selectbox("Category", cat_options, format_func=lambda c: CATEGORY_LABELS.get(c, c))
+    cat_options = ["All"] + list(dict.fromkeys(r.get("category", r.get("mode", "general")) for r in results))
+    cat_filter  = st.selectbox("Category", cat_options, format_func=lambda c: CATEGORY_LABELS.get(c, c.replace("_", " ").title()))
 with filter_col3:
     dim_options = ["All"] + [dl for _, dl, _ in DIMENSIONS]
     dim_filter  = st.selectbox("Dimension", dim_options)
@@ -434,16 +439,16 @@ with filter_col4:
 # Apply filters
 filtered = results
 if show_only == "PASS only":
-    filtered = [r for r in filtered if r.get("overall_pass")]
+    filtered = [r for r in filtered if r.get("overall_pass", r.get("passed"))]
 elif show_only == "FAIL only":
-    filtered = [r for r in filtered if not r.get("overall_pass")]
+    filtered = [r for r in filtered if not r.get("overall_pass", r.get("passed"))]
 elif show_only == "Abstention cases":
     filtered = [r for r in filtered if r.get("abstention_expected")]
 elif show_only == "Hallucination cases":
     filtered = [r for r in filtered if r.get("has_hallucination") is True]
 
 if cat_filter != "All":
-    filtered = [r for r in filtered if r.get("category") == cat_filter]
+    filtered = [r for r in filtered if r.get("category", r.get("mode", "general")) == cat_filter]
 if dim_filter != "All":
     dim_key = next((dk for dk, dl, _ in DIMENSIONS if dl == dim_filter), None)
     if dim_key:
@@ -555,13 +560,13 @@ if num_results:
     st.markdown("### 📉 Numerical Error Distribution")
     scatter_data = [
         {
-            "ID": r["id"],
-            "Category": CATEGORY_LABELS.get(r["category"], r["category"]),
-            "Relative Error (%)": r["relative_error_pct"],
-            "Status": "PASS" if r.get("overall_pass") else "FAIL",
-            "Question": r["question"][:60] + "...",
+            "ID": r.get("id", str(i)),
+            "Category": CATEGORY_LABELS.get(r.get("category", ""), r.get("category", r.get("mode", "General"))),
+            "Relative Error (%)": r.get("relative_error_pct"),
+            "Status": "PASS" if r.get("overall_pass", r.get("passed")) else "FAIL",
+            "Question": r.get("question", "")[:60] + "...",
         }
-        for r in num_results
+        for i, r in enumerate(num_results, 1)
     ]
     df_scatter = pd.DataFrame(scatter_data)
     fig_sc = px.scatter(
