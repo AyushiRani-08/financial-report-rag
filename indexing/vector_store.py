@@ -259,6 +259,8 @@ class _ChromaBackend:
                 "ticker":        ticker,
                 "fiscal_period": fiscal_period,
                 "form_type":     form_type,
+                "statement_scope": "consolidated",
+                "is_consolidated": True,
                 "session_id":    user_id or "global",
                 "page_number":   c["page_number"],
                 "word_count":    c["word_count"],
@@ -288,7 +290,8 @@ class _ChromaBackend:
 
     def query(self, query_vector: list[float], top_k: int, user_id: str,
               paper_id: Optional[str] = None, ticker: Optional[str] = None,
-              fiscal_period: Optional[str] = None) -> list[dict]:
+              fiscal_period: Optional[str] = None,
+              statement_scope: Optional[str] = None) -> list[dict]:
         conds = []
         if paper_id:
             conds.append({"paper_id": paper_id})
@@ -296,6 +299,8 @@ class _ChromaBackend:
             conds.append({"ticker": ticker.upper()})
         if fiscal_period:
             conds.append({"fiscal_period": fiscal_period})
+        if statement_scope:
+            conds.append({"statement_scope": statement_scope.lower()})
         where = ({"$and": conds} if len(conds) > 1
                  else conds[0] if conds else None)
 
@@ -444,6 +449,7 @@ class VectorStore:
         paper_id: Optional[str] = None,
         ticker: Optional[str] = None,
         fiscal_period: Optional[str] = None,
+        statement_scope: Optional[str] = None,
     ) -> list[dict]:
         return self._backend.query(
             query_vector=query_vector,
@@ -452,6 +458,7 @@ class VectorStore:
             paper_id=paper_id,
             ticker=ticker,
             fiscal_period=fiscal_period,
+            statement_scope=statement_scope,
         )
 
     # ── Generic text chunker ─────────────────────────────────────

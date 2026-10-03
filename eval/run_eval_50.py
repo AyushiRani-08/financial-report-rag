@@ -72,7 +72,9 @@ ABSTENTION_PHRASES = [
     "outside the scope", "not covered", "insufficient information",
     "no data", "no record", "not accessible", "beyond the information",
     "not part of", "i cannot", "i'm unable", "insufficient context",
-    "please note that", "the filing does not",
+    "please note that", "the filing does not", "do not contain",
+    "does not contain", "have not occurred", "has not occurred",
+    "not occurred", "not been filed", "unavailable in", "cannot provide information",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -41,6 +41,7 @@ class Retriever:
         paper_id: str | None = None,
         ticker: str | None = None,
         fiscal_period: str | None = None,
+        statement_scope: str | None = None,
         form_type: str | None = None,
         session_id: str | None = None,
         where_override: dict | None = None,
@@ -48,9 +49,7 @@ class Retriever:
         """
         Returns the top_k most relevant chunks for the query.
 
-        User isolation is enforced automatically by the VectorStore backend:
-          - pgvector: WHERE user_id = <user_id> in SQL
-          - ChromaDB: WHERE session_id = <session_id> metadata filter
+        Supports statement_scope ('consolidated' vs 'standalone').
         """
         # 1. Embed query
         query_vector = self.embedder.embed_query(query).tolist()
@@ -62,9 +61,20 @@ class Retriever:
             paper_id=paper_id,
             ticker=ticker,
             fiscal_period=fiscal_period,
+            statement_scope=statement_scope,
         )
 
-        # 3. Graceful fallback: relax fiscal_period if no results
+        # 3. Graceful fallback: relax statement_scope or fiscal_period if no results
+        if not chunks and statement_scope:
+            chunks = self.vector_store.query(
+                query_vector=query_vector,
+                top_k=top_k,
+                paper_id=paper_id,
+                ticker=ticker,
+                fiscal_period=fiscal_period,
+                statement_scope=None,
+            )
+
         if not chunks and fiscal_period and ticker and not paper_id:
             chunks = self.vector_store.query(
                 query_vector=query_vector,
@@ -72,6 +82,7 @@ class Retriever:
                 paper_id=None,
                 ticker=ticker,
                 fiscal_period=None,
+                statement_scope=None,
             )
 
         return chunks

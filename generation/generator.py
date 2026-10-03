@@ -13,6 +13,7 @@ from retrieval.retriever import Retriever
 from retrieval.xbrl_retriever import XBRLRetriever
 from utils.logger import log_query, Timer
 from utils.metadata_parser import parse_filing_metadata, COMPANY_TICKER_MAP
+from utils.abstention_guard import check_pre_retrieval_abstention
 
 load_dotenv()
 
@@ -217,6 +218,21 @@ class RAGGenerator:
             else:
                 active_period = raw_period
 
+    # --- Layer 1: Pre-Retrieval Abstention Gate ---
+    abstention = check_pre_retrieval_abstention(query, ticker=active_ticker, fiscal_period=active_period)
+    if abstention:
+        log_query(
+            query=query, query_type="qa_abstain", paper_id=paper_id, top_k=0,
+            num_chunks_retrieved=0, similarity_scores=[],
+            retrieval_latency_ms=0, llm_latency_ms=0, total_latency_ms=1,
+            model_name=self.model_name, answer_length=len(abstention["reason"]),
+        )
+        return {
+            "answer": abstention["reason"],
+            "sources": [],
+            "abstained": True,
+        }
+
     # --- Isolated Retrieval with timing ---
     with Timer() as retrieval_timer:
       chunks = self.retriever.retrieve(
@@ -225,6 +241,7 @@ class RAGGenerator:
           paper_id=paper_id,
           ticker=active_ticker,
           fiscal_period=active_period,
+          statement_scope="consolidated",
           session_id=session_id,
       )
 
@@ -267,13 +284,19 @@ class RAGGenerator:
     xbrl_section = f"{xbrl_block}\n\n" if xbrl_block else ""
 
     system_prompt = (
-        "You are an expert Senior Financial Analyst specialized in explaining corporate financial reports (10-K, 10-Q, quarterly earnings) to retail investors.\n"
-        "Rules:\n"
-        "1. Answer clearly, accurately, and concisely using ONLY the provided CONTEXT.\n"
-        "2. If STRUCTURED FINANCIAL DATA is provided at the top, treat those figures as ground truth — they come directly from official XBRL filings.\n"
-        "3. Explain complex financial jargon (e.g. EBITDA, Free Cash Flow, Diluted EPS) in accessible terms for retail investors when relevant.\n"
-        "4. If the context does not contain the answer, state: 'I cannot find sufficient information in the indexed financial report.'\n"
-        "5. Always cite specific page or section numbers using [Page X] notation whenever citing metrics or statements."
+        "You are an expert Senior Financial Analyst specialized in explaining corporate financial reports (10-K, 10-Q, quarterly earnings) to retail investors.\n\n"
+        "CORE REPORTING & ACCURACY RULES:\n"
+        "1. GROUNDING & EVIDENCE: Answer clearly, accurately, and concisely using ONLY the provided CONTEXT. Never speculate or fabricate.\n"
+        "2. STANDALONE VS. CONSOLIDATED: Clearly state the reporting scope. Annual 10-K filings report consolidated corporate operations. Label group figures as '[Consolidated]' (e.g. '[Consolidated] Total Net Sales: $391.04B'). If parent-only, label as '[Standalone]'.\n"
+        "3. XBRL VERIFIED FACTS: If STRUCTURED FINANCIAL DATA is provided at the top, treat those numbers as audited ground truth directly from SEC XBRL filings.\n"
+        "4. ABSTENTION PROTOCOL: If the context does not contain the answer (e.g. non-disclosed divisional headcounts, daily stock prices, competitor financials, or forward-looking targets), state: 'The provided financial reports do not disclose [topic].' Do not guess.\n"
+        "5. CITATIONS: Always cite specific page or section numbers using [Page X] notation whenever citing metrics or statements.\n\n"
+        "RETAIL INVESTOR ANALYSIS SECTION:\n"
+        "Unless you are abstaining/refusing due to missing data, conclude your answer with an investor analysis section formatted as follows:\n\n"
+        "### 💡 What Does This Mean for an Investor?\n"
+        "• 🟢 **Positive Signals**: 1-2 concise bullet points highlighting financial strengths, margin expansion, or capital returns shown in the data.\n"
+        "• 🟡 **Things to Monitor**: 1-2 concise bullet points highlighting key operational risks, cost pressures, or trends to watch.\n"
+        "• 📌 **Key Takeaway**: One sentence summarizing the overall implication for shareholders."
     )
 
     user_prompt = f"""{xbrl_section}CONTEXT FROM FINANCIAL REPORT:
@@ -359,10 +382,19 @@ ANALYST RESPONSE:"""
               raw_period = fy_match.group(1).replace(" ", "").upper()
               active_period = f"FY{raw_period}" if raw_period.isdigit() else raw_period
 
+      # Layer 1: Pre-Retrieval Abstention Gate
+      abstention = check_pre_retrieval_abstention(query, ticker=active_ticker, fiscal_period=active_period)
+      if abstention:
+          if sources_out is not None:
+              sources_out.clear()
+          yield abstention["reason"]
+          return
+
       # Retrieval
       chunks = self.retriever.retrieve(
           query=query, top_k=top_k, paper_id=paper_id,
-          ticker=active_ticker, fiscal_period=active_period, session_id=session_id,
+          ticker=active_ticker, fiscal_period=active_period,
+          statement_scope="consolidated", session_id=session_id,
       )
       if not chunks and active_ticker and not paper_id:
           chunks = self.retriever.retrieve(query=query, top_k=top_k, session_id=session_id)
@@ -389,16 +421,19 @@ ANALYST RESPONSE:"""
       xbrl_section = f"{xbrl_block}\n\n" if xbrl_block else ""
 
       system_prompt = (
-          "You are an expert Senior Financial Analyst specialized in explaining corporate "
-          "financial reports (10-K, 10-Q, quarterly earnings) to retail investors.\n"
-          "Rules:\n"
-          "1. Answer clearly, accurately, and concisely using ONLY the provided CONTEXT.\n"
-          "2. If STRUCTURED FINANCIAL DATA is provided at the top, treat those figures as "
-          "ground truth — they come directly from official XBRL filings.\n"
-          "3. Explain complex financial jargon in accessible terms for retail investors.\n"
-          "4. If the context does not contain the answer, state: 'I cannot find sufficient "
-          "information in the indexed financial report.'\n"
-          "5. Always cite specific page or section numbers using [Page X] notation."
+          "You are an expert Senior Financial Analyst specialized in explaining corporate financial reports (10-K, 10-Q, quarterly earnings) to retail investors.\n\n"
+          "CORE REPORTING & ACCURACY RULES:\n"
+          "1. GROUNDING & EVIDENCE: Answer clearly, accurately, and concisely using ONLY the provided CONTEXT. Never speculate or fabricate.\n"
+          "2. STANDALONE VS. CONSOLIDATED: Clearly state the reporting scope. Annual 10-K filings report consolidated corporate operations. Label group figures as '[Consolidated]' (e.g. '[Consolidated] Total Net Sales: $391.04B'). If parent-only, label as '[Standalone]'.\n"
+          "3. XBRL VERIFIED FACTS: If STRUCTURED FINANCIAL DATA is provided at the top, treat those numbers as audited ground truth directly from SEC XBRL filings.\n"
+          "4. ABSTENTION PROTOCOL: If the context does not contain the answer (e.g. non-disclosed divisional headcounts, daily stock prices, competitor financials, or forward-looking targets), state: 'The provided financial reports do not disclose [topic].' Do not guess.\n"
+          "5. CITATIONS: Always cite specific page or section numbers using [Page X] notation whenever citing metrics or statements.\n\n"
+          "RETAIL INVESTOR ANALYSIS SECTION:\n"
+          "Unless you are abstaining/refusing due to missing data, conclude your answer with an investor analysis section formatted as follows:\n\n"
+          "### 💡 What Does This Mean for an Investor?\n"
+          "• 🟢 **Positive Signals**: 1-2 concise bullet points highlighting financial strengths, margin expansion, or capital returns shown in the data.\n"
+          "• 🟡 **Things to Monitor**: 1-2 concise bullet points highlighting key operational risks, cost pressures, or trends to watch.\n"
+          "• 📌 **Key Takeaway**: One sentence summarizing the overall implication for shareholders."
       )
       user_prompt = (
           f"{xbrl_section}CONTEXT FROM FINANCIAL REPORT:\n{context}\n\n"
