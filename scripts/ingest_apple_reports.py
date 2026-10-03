@@ -138,7 +138,7 @@ def ingest_chroma(filing: dict, download_dir: Path) -> dict:
     # ── Step 2: Chunk → Embed → Store in ChromaDB ────────────────────────
     print(f"  🔢 Embedding and storing in ChromaDB...")
     try:
-        vs = VectorStore(persist_directory="data/chroma_db")
+        vs = VectorStore(persist_directory="data/chroma_db", backend="chroma")
         n_chunks = vs.add_document(
             file_path=local_path,
             paper_id=filing["paper_id"],

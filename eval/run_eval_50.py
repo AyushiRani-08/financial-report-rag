@@ -52,6 +52,7 @@ from dotenv import load_dotenv
 from groq import Groq
 from generation.generator import RAGGenerator
 from indexing.vector_store import VectorStore
+from retrieval.retriever import Retriever
 
 load_dotenv()
 
@@ -606,8 +607,9 @@ def main():
     with open(GOLDEN_SET, encoding="utf-8") as f:
         golden_set = json.load(f)
 
-    vector_store = VectorStore(persist_directory="data/chroma_db")
-    generator    = RAGGenerator(model_name=args.model)
+    vector_store = VectorStore(persist_directory="data/chroma_db", backend="chroma")
+    retriever    = Retriever(vector_store=vector_store)
+    generator    = RAGGenerator(retriever=retriever, model_name=args.model)
     groq_client  = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
     results = run_eval(

@@ -337,11 +337,22 @@ class VectorStore:
         persist_directory: str = "data/chroma_db",
         collection_name: str = "papers",
         user_id: Optional[str] = None,
+        backend: Optional[str] = None,
     ):
         self.user_id = user_id or "global"
         self.embedder = Embedder()
 
-        if _use_supabase():
+        env_backend = os.environ.get("VECTOR_BACKEND", "").lower()
+        if backend == "chroma" or env_backend == "chroma":
+            use_supa = False
+        elif backend == "supabase" or env_backend == "supabase":
+            use_supa = True
+        elif _use_supabase() and _is_valid_uuid(self.user_id):
+            use_supa = True
+        else:
+            use_supa = False
+
+        if use_supa:
             self._backend = _SupabaseBackend(user_id=self.user_id)
             # Expose a .collection shim for legacy callers in app.py
             self.collection = _CollectionShim(self._backend, self.user_id)
