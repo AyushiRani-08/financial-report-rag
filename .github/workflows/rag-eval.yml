@@ -1,0 +1,616 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# .github/workflows/rag-eval.yml
+#
+# Financial RAG — Evaluation CI Pipeline
+# ========================================
+# Triggers on every push / PR to main.
+# Also runs on a nightly schedule so regressions are caught even without code
+# changes (e.g., if the upstream model degrades).
+#
+# Jobs
+# ────
+# 1. lint-syntax   — fast gate: Python syntax + import validation
+# 2. ingest-data   — seed ChromaDB + PostgreSQL with Apple 3-year 10-Ks
+#                    (skipped if the chroma_db cache artifact is still valid)
+# 3. run-eval      — execute 50-question evaluation suite
+# 4. check-thresholds — parse results, compare vs thresholds, PASS or FAIL build
+# 5. report        — post a markdown summary to the PR / job summary
+#
+# Required GitHub Secrets
+# ────────────────────────
+#   POSTGRES_DSN    — full DSN e.g. postgresql://user:pass@host:5432/dbname
+#   GROQ_API_KEY    — Groq API key for generation + LLM-as-Judge
+#
+# Optional Secrets (override defaults)
+#   EVAL_MODEL           — model for RAG answers (default: openai/gpt-oss-20b)
+#   EVAL_JUDGE_MODEL     — model for groundedness judge (default: openai/gpt-oss-20b)
+#
+# Accuracy Thresholds (edit in check-thresholds job below)
+#   overall_pass_rate       >= 60 %
+#   retrieval_accuracy      >= 70 %
+#   numerical_accuracy      >= 65 %
+#   calculation_accuracy    >= 55 %
+#   groundedness_accuracy   >= 60 %
+#   abstention_accuracy     >= 75 %
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: 🧪 RAG Evaluation CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    # Nightly at 02:00 UTC — catches model/API regressions
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      eval_limit:
+        description: "Max questions to evaluate (empty = all 50)"
+        required: false
+        default: ""
+      category_filter:
+        description: "Filter to one category (empty = all)"
+        required: false
+        default: ""
+
+concurrency:
+  group: rag-eval-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  EVAL_RESULTS_DIR: eval/results
+  CHROMA_CACHE_KEY: chroma-apple-3yr-v2    # bump this key to force re-ingestion
+
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 1 — Fast syntax / lint gate (no secrets needed)
+  # ════════════════════════════════════════════════════════════════════════════
+  lint-syntax:
+    name: 🔍 Lint & Syntax Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install minimal deps
+        run: |
+          pip install --upgrade pip
+          pip install pyflakes
+
+      - name: Python syntax check (all .py files)
+        run: |
+          echo "Checking syntax across all Python files..."
+          python -m py_compile \
+            app.py \
+            eval/run_eval_50.py \
+            scripts/ingest_apple_reports.py \
+            indexing/vector_store.py \
+            generation/generator.py \
+            ingestion/sec_fetcher.py \
+            retrieval/retriever.py
+          echo "✅ All files passed syntax check"
+
+      - name: Validate golden set JSON
+        run: |
+          python - <<'EOF'
+          import json, sys
+          qs = json.load(open("eval/golden_set_50.json"))
+          assert len(qs) == 50, f"Expected 50 questions, got {len(qs)}"
+          cats = set(q["category"] for q in qs)
+          assert len(cats) == 10, f"Expected 10 categories, got {len(cats)}"
+          dims = set()
+          for q in qs:
+              dims.update(q.get("eval_dimensions", []))
+          required = {"retrieval_accuracy","numerical_accuracy","calculation_accuracy",
+                      "groundedness_accuracy","abstention_accuracy"}
+          assert required <= dims, f"Missing dimensions: {required - dims}"
+          print(f"✅ Golden set valid: {len(qs)} questions, {len(cats)} categories, {len(dims)} dimensions")
+          EOF
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 2 — Ingest Apple 3-year reports (ChromaDB + PostgreSQL)
+  # ════════════════════════════════════════════════════════════════════════════
+  ingest-data:
+    name: 📥 Ingest Apple 10-K Reports (3 Years)
+    runs-on: ubuntu-latest
+    needs: lint-syntax
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── Try to restore the cached ChromaDB so we skip re-embedding ─────────
+      - name: Restore ChromaDB cache
+        id: chroma-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: data/chroma_db
+          key: ${{ env.CHROMA_CACHE_KEY }}
+
+      # ── Restore downloaded raw HTML filings cache ──────────────────────────
+      - name: Restore raw filings cache
+        uses: actions/cache/restore@v4
+        with:
+          path: data/raw_pdfs
+          key: apple-raw-filings-v2
+
+      # ── XBRL → PostgreSQL (always re-run; idempotent INSERT logic handles dupes) ──
+      - name: Ingest XBRL facts into PostgreSQL
+        if: steps.chroma-cache.outputs.cache-hit != 'true'
+        env:
+          POSTGRES_DSN: ${{ secrets.POSTGRES_DSN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          echo "Ingesting XBRL structured facts for AAPL FY2022, FY2023, FY2024..."
+          python scripts/ingest_apple_reports.py \
+            --years 2022 2023 2024 \
+            --skip-chroma
+        # Note: --skip-chroma because ChromaDB is handled separately below
+
+      # ── HTML → ChromaDB (only if cache miss) ─────────────────────────────
+      - name: Ingest HTML filings into ChromaDB
+        if: steps.chroma-cache.outputs.cache-hit != 'true'
+        env:
+          POSTGRES_DSN: ${{ secrets.POSTGRES_DSN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          echo "Downloading and embedding Apple 10-K HTML reports..."
+          python scripts/ingest_apple_reports.py \
+            --years 2022 2023 2024 \
+            --skip-xbrl
+
+      - name: Verify ingestion completeness
+        env:
+          POSTGRES_DSN: ${{ secrets.POSTGRES_DSN }}
+        run: |
+          python - <<'EOF'
+          import os, sys, chromadb
+          from pathlib import Path
+
+          # Check ChromaDB
+          client = chromadb.PersistentClient(path="data/chroma_db")
+          col = client.get_or_create_collection("papers")
+          count = col.count()
+          print(f"ChromaDB chunks: {count}")
+          if count == 0:
+              print("❌ ChromaDB is empty! Ingestion may have failed.")
+              sys.exit(1)
+
+          # Check for AAPL docs
+          metas = col.get(include=["metadatas"])["metadatas"]
+          aapl_periods = set(m.get("fiscal_period","") for m in metas if m and m.get("ticker") == "AAPL")
+          print(f"AAPL periods in ChromaDB: {sorted(aapl_periods)}")
+          expected = {"FY2022", "FY2023", "FY2024"}
+          missing = expected - aapl_periods
+          if missing:
+              print(f"⚠️  Warning: missing periods {missing} (may still be indexed under different labels)")
+
+          print(f"✅ ChromaDB verification passed")
+          EOF
+
+      # ── Save ChromaDB to cache for next run ─────────────────────────────
+      - name: Save ChromaDB cache
+        if: steps.chroma-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: data/chroma_db
+          key: ${{ env.CHROMA_CACHE_KEY }}
+
+      - name: Save raw filings cache
+        if: steps.chroma-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: data/raw_pdfs
+          key: apple-raw-filings-v2
+
+      # Always restore ChromaDB for subsequent jobs (upload as artifact)
+      - name: Upload ChromaDB as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chroma-db
+          path: data/chroma_db
+          retention-days: 7
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 3 — Run the 50-question evaluation
+  # ════════════════════════════════════════════════════════════════════════════
+  run-eval:
+    name: 🧪 Run 50-Question Evaluation
+    runs-on: ubuntu-latest
+    needs: ingest-data
+    timeout-minutes: 90   # ~1.5 min per question at ~90 s avg with pacing
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Download the ChromaDB built in ingest-data
+      - name: Download ChromaDB artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: chroma-db
+          path: data/chroma_db
+
+      - name: Run evaluation suite
+        id: eval
+        env:
+          POSTGRES_DSN:     ${{ secrets.POSTGRES_DSN }}
+          GROQ_API_KEY:     ${{ secrets.GROQ_API_KEY }}
+          EVAL_MODEL:       ${{ secrets.EVAL_MODEL || 'openai/gpt-oss-20b' }}
+          EVAL_JUDGE_MODEL: ${{ secrets.EVAL_JUDGE_MODEL || 'openai/gpt-oss-20b' }}
+        run: |
+          mkdir -p ${{ env.EVAL_RESULTS_DIR }}
+          LIMIT_ARG=""
+          CATEGORY_ARG=""
+          if [ -n "${{ github.event.inputs.eval_limit }}" ]; then
+            LIMIT_ARG="--limit ${{ github.event.inputs.eval_limit }}"
+          fi
+          if [ -n "${{ github.event.inputs.category_filter }}" ]; then
+            CATEGORY_ARG="--category ${{ github.event.inputs.category_filter }}"
+          fi
+
+          echo "Starting evaluation..."
+          python eval/run_eval_50.py \
+            --model "${EVAL_MODEL}" \
+            $LIMIT_ARG $CATEGORY_ARG \
+            2>&1 | tee eval_run.log
+
+          # Find the newest result file
+          RESULT_FILE=$(ls -t ${{ env.EVAL_RESULTS_DIR }}/eval50_*.json 2>/dev/null | head -1)
+          if [ -z "$RESULT_FILE" ]; then
+            echo "❌ No result file generated!"
+            exit 1
+          fi
+          echo "result_file=${RESULT_FILE}" >> $GITHUB_OUTPUT
+          echo "Evaluation complete: ${RESULT_FILE}"
+
+      - name: Upload evaluation results
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: |
+            ${{ env.EVAL_RESULTS_DIR }}/eval50_*.json
+            eval_run.log
+          retention-days: 30
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 4 — Parse results, enforce accuracy thresholds
+  # ════════════════════════════════════════════════════════════════════════════
+  check-thresholds:
+    name: 📊 Accuracy Gate (Pass/Fail Thresholds)
+    runs-on: ubuntu-latest
+    needs: run-eval
+    timeout-minutes: 5
+
+    # ── EDIT THESE THRESHOLDS to control when the build fails ──────────────
+    env:
+      THRESHOLD_OVERALL:       "60"   # % — composite pass rate across all 50 Qs
+      THRESHOLD_RETRIEVAL:     "70"   # % — retrieval_accuracy dimension
+      THRESHOLD_NUMERICAL:     "65"   # % — numerical_accuracy dimension
+      THRESHOLD_CALCULATION:   "55"   # % — calculation_accuracy dimension
+      THRESHOLD_GROUNDEDNESS:  "60"   # % — groundedness_accuracy dimension
+      THRESHOLD_ABSTENTION:    "75"   # % — abstention_accuracy dimension (highest: easy to get right)
+
+    outputs:
+      overall_accuracy:      ${{ steps.parse.outputs.overall_accuracy }}
+      retrieval_accuracy:    ${{ steps.parse.outputs.retrieval_accuracy }}
+      numerical_accuracy:    ${{ steps.parse.outputs.numerical_accuracy }}
+      calculation_accuracy:  ${{ steps.parse.outputs.calculation_accuracy }}
+      groundedness_accuracy: ${{ steps.parse.outputs.groundedness_accuracy }}
+      abstention_accuracy:   ${{ steps.parse.outputs.abstention_accuracy }}
+      gate_passed:           ${{ steps.gate.outputs.gate_passed }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download eval results
+        uses: actions/download-artifact@v4
+        with:
+          name: eval-results
+          path: eval/results
+
+      - name: Parse accuracy metrics
+        id: parse
+        run: |
+          python - <<'PYEOF'
+          import json, os, sys
+          from pathlib import Path
+
+          # Find the most recent result file
+          result_files = sorted(Path("eval/results").glob("eval50_*.json"), reverse=True)
+          if not result_files:
+              print("❌ No eval50_*.json results found!")
+              sys.exit(1)
+
+          data    = json.loads(result_files[0].read_text())
+          results = data.get("results", [])
+          print(f"Loaded {len(results)} results from {result_files[0].name}")
+
+          def pct(lst):
+              valid = [v for v in lst if v is not None]
+              if not valid: return 0.0
+              return round(100 * sum(1 for v in valid if v is True) / len(valid), 1)
+
+          metrics = {
+              "overall_accuracy":      pct([r.get("overall_pass") for r in results]),
+              "retrieval_accuracy":    pct([r.get("retrieval_accuracy") for r in results if r.get("retrieval_accuracy") is not None]),
+              "numerical_accuracy":    pct([r.get("numerical_accuracy") for r in results if r.get("numerical_accuracy") is not None]),
+              "calculation_accuracy":  pct([r.get("calculation_accuracy") for r in results if r.get("calculation_accuracy") is not None]),
+              "groundedness_accuracy": pct([r.get("groundedness_accuracy") for r in results if r.get("groundedness_accuracy") is not None]),
+              "abstention_accuracy":   pct([r.get("abstention_accuracy") for r in results if r.get("abstention_accuracy") is not None]),
+          }
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              for k, v in metrics.items():
+                  f.write(f"{k}={v}\n")
+
+          print("\n=== ACCURACY METRICS ===")
+          for k, v in metrics.items():
+              print(f"  {k:30s}: {v}%")
+          PYEOF
+
+      - name: Enforce accuracy thresholds
+        id: gate
+        run: |
+          python - <<'PYEOF'
+          import os, sys
+
+          thresholds = {
+              "overall_accuracy":      float(os.environ["THRESHOLD_OVERALL"]),
+              "retrieval_accuracy":    float(os.environ["THRESHOLD_RETRIEVAL"]),
+              "numerical_accuracy":    float(os.environ["THRESHOLD_NUMERICAL"]),
+              "calculation_accuracy":  float(os.environ["THRESHOLD_CALCULATION"]),
+              "groundedness_accuracy": float(os.environ["THRESHOLD_GROUNDEDNESS"]),
+              "abstention_accuracy":   float(os.environ["THRESHOLD_ABSTENTION"]),
+          }
+
+          # Read from previous step's outputs via env vars (injected by GitHub)
+          actuals = {
+              "overall_accuracy":      float(os.environ.get("OVERALL",      "0")),
+              "retrieval_accuracy":    float(os.environ.get("RETRIEVAL",    "0")),
+              "numerical_accuracy":    float(os.environ.get("NUMERICAL",    "0")),
+              "calculation_accuracy":  float(os.environ.get("CALCULATION",  "0")),
+              "groundedness_accuracy": float(os.environ.get("GROUNDEDNESS", "0")),
+              "abstention_accuracy":   float(os.environ.get("ABSTENTION",   "0")),
+          }
+
+          print("\n╔══════════════════════════════════════════════════════════════╗")
+          print("║          RAG ACCURACY GATE RESULTS                          ║")
+          print("╠══════════════════════════════════════════════════════════════╣")
+          print(f"{'║  Dimension':<32} {'Actual':>8} {'Threshold':>10} {'Status':>8}  ║")
+          print("╠══════════════════════════════════════════════════════════════╣")
+
+          failures = []
+          for dim, threshold in thresholds.items():
+              actual = actuals.get(dim, 0.0)
+              passed = actual >= threshold
+              status = "✅ PASS" if passed else "❌ FAIL"
+              label  = dim.replace("_", " ").title()
+              print(f"║  {label:<30} {actual:>7.1f}%  {threshold:>8.0f}%  {status:>8}  ║")
+              if not passed:
+                  failures.append((dim, actual, threshold))
+
+          print("╚══════════════════════════════════════════════════════════════╝")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"gate_passed={'true' if not failures else 'false'}\n")
+
+          if failures:
+              print(f"\n❌ BUILD FAILED — {len(failures)} dimension(s) below threshold:")
+              for dim, actual, threshold in failures:
+                  print(f"   • {dim}: {actual:.1f}% < {threshold:.0f}% required")
+              sys.exit(1)
+          else:
+              print("\n✅ ALL THRESHOLDS MET — Build passed!")
+        env:
+          THRESHOLD_OVERALL:       ${{ env.THRESHOLD_OVERALL }}
+          THRESHOLD_RETRIEVAL:     ${{ env.THRESHOLD_RETRIEVAL }}
+          THRESHOLD_NUMERICAL:     ${{ env.THRESHOLD_NUMERICAL }}
+          THRESHOLD_CALCULATION:   ${{ env.THRESHOLD_CALCULATION }}
+          THRESHOLD_GROUNDEDNESS:  ${{ env.THRESHOLD_GROUNDEDNESS }}
+          THRESHOLD_ABSTENTION:    ${{ env.THRESHOLD_ABSTENTION }}
+          OVERALL:      ${{ needs.check-thresholds.outputs.overall_accuracy }}
+          RETRIEVAL:    ${{ needs.check-thresholds.outputs.retrieval_accuracy }}
+          NUMERICAL:    ${{ needs.check-thresholds.outputs.numerical_accuracy }}
+          CALCULATION:  ${{ needs.check-thresholds.outputs.calculation_accuracy }}
+          GROUNDEDNESS: ${{ needs.check-thresholds.outputs.groundedness_accuracy }}
+          ABSTENTION:   ${{ needs.check-thresholds.outputs.abstention_accuracy }}
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 5 — Post markdown summary to PR / Job Summary
+  # ════════════════════════════════════════════════════════════════════════════
+  report:
+    name: 📋 Post Evaluation Report
+    runs-on: ubuntu-latest
+    needs: [run-eval, check-thresholds]
+    if: always()   # run even if check-thresholds failed so we always get a report
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download eval results
+        uses: actions/download-artifact@v4
+        with:
+          name: eval-results
+          path: eval/results
+        continue-on-error: true
+
+      - name: Generate markdown report
+        id: report
+        run: |
+          python - <<'PYEOF'
+          import json, os, sys
+          from pathlib import Path
+          from datetime import datetime
+
+          result_files = sorted(Path("eval/results").glob("eval50_*.json"), reverse=True)
+          if not result_files:
+              report = "⚠️ No evaluation results found — evaluation may have failed."
+              Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text(report)
+              sys.exit(0)
+
+          data    = json.loads(result_files[0].read_text())
+          results = data.get("results", [])
+          ts      = data.get("run_timestamp", "unknown")
+          model   = data.get("model", "unknown")
+
+          def pct(lst):
+              valid = [v for v in lst if v is not None]
+              if not valid: return 0.0
+              return round(100 * sum(1 for v in valid if v is True) / len(valid), 1)
+
+          def badge(val, threshold):
+              return "🟢" if val >= threshold else "🔴"
+
+          thresholds = {"overall": 60, "retrieval": 70, "numerical": 65,
+                        "calculation": 55, "groundedness": 60, "abstention": 75}
+
+          overall      = pct([r.get("overall_pass") for r in results])
+          retrieval    = pct([r.get("retrieval_accuracy")    for r in results if r.get("retrieval_accuracy")    is not None])
+          numerical    = pct([r.get("numerical_accuracy")    for r in results if r.get("numerical_accuracy")    is not None])
+          calculation  = pct([r.get("calculation_accuracy")  for r in results if r.get("calculation_accuracy")  is not None])
+          groundedness = pct([r.get("groundedness_accuracy") for r in results if r.get("groundedness_accuracy") is not None])
+          abstention   = pct([r.get("abstention_accuracy")   for r in results if r.get("abstention_accuracy")   is not None])
+          halluc       = sum(1 for r in results if r.get("has_hallucination") is True)
+          lats         = [r.get("latency_ms", 0) for r in results if r.get("latency_ms")]
+          avg_lat      = round(sum(lats)/len(lats)/1000, 1) if lats else "N/A"
+
+          # Per-category breakdown
+          CATS = {
+              "direct_fact_retrieval":     "Direct Fact Retrieval",
+              "yoy_comparison":            "YoY Comparison",
+              "multi_year_trend":          "Multi-Year Trend",
+              "cross_company_comparison":  "Cross-Company",
+              "financial_ratio":           "Financial Ratio",
+              "semantic_retrieval":        "Semantic / Paraphrase",
+              "time_period_understanding": "Time-Period",
+              "multi_hop_reasoning":       "Multi-Hop Reasoning",
+              "hallucination_unavailable": "Hallucination Guard",
+              "adversarial_hard":          "Adversarial Hard",
+          }
+
+          cat_rows = ""
+          for cat_key, cat_label in CATS.items():
+              cat_res = [r for r in results if r.get("category") == cat_key]
+              if not cat_res:
+                  continue
+              cp = pct([r.get("overall_pass") for r in cat_res])
+              mark = "🟢" if cp >= 60 else ("🟡" if cp >= 40 else "🔴")
+              cat_rows += f"| {cat_label} | {mark} {cp:.0f}% | {sum(1 for r in cat_res if r.get('overall_pass'))}/{len(cat_res)} |\n"
+
+          report = f"""# 🧪 Financial RAG Evaluation Report
+
+          **Run:** `{ts}` &nbsp;|&nbsp; **Model:** `{model}` &nbsp;|&nbsp; **Questions:** `{len(results)}`
+
+          ## 🎯 Accuracy by Dimension
+
+          | Dimension | Score | Threshold | Status |
+          |-----------|-------|-----------|--------|
+          | Overall Pass Rate | **{overall:.1f}%** | ≥ {thresholds['overall']}% | {badge(overall, thresholds['overall'])} |
+          | Retrieval Accuracy | **{retrieval:.1f}%** | ≥ {thresholds['retrieval']}% | {badge(retrieval, thresholds['retrieval'])} |
+          | Numerical Accuracy | **{numerical:.1f}%** | ≥ {thresholds['numerical']}% | {badge(numerical, thresholds['numerical'])} |
+          | Calculation Accuracy | **{calculation:.1f}%** | ≥ {thresholds['calculation']}% | {badge(calculation, thresholds['calculation'])} |
+          | Groundedness Accuracy | **{groundedness:.1f}%** | ≥ {thresholds['groundedness']}% | {badge(groundedness, thresholds['groundedness'])} |
+          | Abstention Accuracy | **{abstention:.1f}%** | ≥ {thresholds['abstention']}% | {badge(abstention, thresholds['abstention'])} |
+
+          > 🔴 = below threshold (build fails) &nbsp;|&nbsp; 🟢 = above threshold (build passes)
+
+          ## 📋 Results by Question Category
+
+          | Category | Pass Rate | Passed |
+          |----------|-----------|--------|
+          {cat_rows}
+          ## ⚠️ Risk Metrics
+
+          | Metric | Value |
+          |--------|-------|
+          | Hallucinations detected | {halluc} / {len(results)} |
+          | Avg response latency | {avg_lat}s |
+
+          ---
+          *Generated by Financial RAG Evaluation CI · [View full results artifact](https://github.com/${{{{ github.repository }}}}/actions/runs/${{{{ github.run_id }}}})*
+          """
+
+          # Dedent
+          import textwrap
+          report = textwrap.dedent(report)
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
+          Path(summary_path).write_text(report, encoding="utf-8")
+          print("✅ Report written to job summary")
+          PYEOF
+
+      - name: Comment on PR (if PR event)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            // Job summary is not directly readable here; use a simplified comment
+            const gate = '${{ needs.check-thresholds.outputs.gate_passed }}';
+            const icon = gate === 'true' ? '✅' : '❌';
+            const overall = '${{ needs.check-thresholds.outputs.overall_accuracy }}';
+            const retrieval = '${{ needs.check-thresholds.outputs.retrieval_accuracy }}';
+            const numerical = '${{ needs.check-thresholds.outputs.numerical_accuracy }}';
+            const calculation = '${{ needs.check-thresholds.outputs.calculation_accuracy }}';
+            const groundedness = '${{ needs.check-thresholds.outputs.groundedness_accuracy }}';
+            const abstention = '${{ needs.check-thresholds.outputs.abstention_accuracy }}';
+
+            const body = `## ${icon} RAG Evaluation Results
+
+            | Dimension | Score | Threshold |
+            |-----------|-------|-----------|
+            | Overall Pass Rate | **${overall}%** | ≥ 60% |
+            | Retrieval Accuracy | **${retrieval}%** | ≥ 70% |
+            | Numerical Accuracy | **${numerical}%** | ≥ 65% |
+            | Calculation Accuracy | **${calculation}%** | ≥ 55% |
+            | Groundedness Accuracy | **${groundedness}%** | ≥ 60% |
+            | Abstention Accuracy | **${abstention}%** | ≥ 75% |
+
+            [📊 Full report →](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
