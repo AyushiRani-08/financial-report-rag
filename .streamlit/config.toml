@@ -1,6 +1,9 @@
 [server]
 fileWatcherType = "none"
 headless = true
+enableWebsocketCompression = false
+# Bind to all interfaces (required for Streamlit Cloud container routing)
+address = "0.0.0.0"
 
 [client]
 showErrorDetails = true

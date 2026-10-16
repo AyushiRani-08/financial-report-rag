@@ -218,7 +218,7 @@ def _get_redirect_url() -> str:
     override = os.environ.get("OAUTH_REDIRECT_URL", "")
     if override:
         return override
-    return "http://localhost:8501"
+    return os.environ.get("STREAMLIT_SERVER_ADDRESS", "http://localhost:8501")
 
 
 # ─────────────────────────────────────────────
