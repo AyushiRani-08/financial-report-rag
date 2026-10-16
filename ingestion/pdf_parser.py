@@ -3,12 +3,25 @@ import io
 from pathlib import Path
 from PIL import Image
 import pymupdf  # Modern replacement for fitz
-import pytesseract
 
-# Windows binary path for Tesseract
-pytesseract.pytesseract.tesseract_cmd = (
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-)
+# Tesseract OCR is optional — used only for scanned/image-only PDFs.
+# On Streamlit Cloud and other Linux environments without Tesseract installed,
+# OCR is silently skipped and PyMuPDF native text extraction is used instead.
+# SEC filings are selectable text, so this covers 99% of real-world uploads.
+_OCR_AVAILABLE = False
+try:
+    import pytesseract
+    import shutil
+    # Prefer system PATH first (Linux/Cloud); fall back to Windows install path
+    if shutil.which("tesseract"):
+        _OCR_AVAILABLE = True
+    else:
+        _win_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        if Path(_win_path).exists():
+            pytesseract.pytesseract.tesseract_cmd = _win_path
+            _OCR_AVAILABLE = True
+except ImportError:
+    pass
 
 
 def extract_raw_text(
@@ -16,7 +29,8 @@ def extract_raw_text(
 ) -> list[dict]:
     """Extract text page-by-page.
 
-    Falls back to Tesseract OCR if text length is less than ocr_threshold.
+    Falls back to Tesseract OCR for scanned pages only if Tesseract is
+    installed and available. Otherwise skips OCR gracefully.
     """
     path = Path(pdf_path)
     if not path.exists():
@@ -28,8 +42,8 @@ def extract_raw_text(
         for i, page in enumerate(doc):
             text = page.get_text().strip()
 
-            # Scanned page fallback
-            if len(text) < ocr_threshold:
+            # Scanned page fallback — only if Tesseract is available
+            if len(text) < ocr_threshold and _OCR_AVAILABLE:
                 pix = page.get_pixmap(dpi=dpi)
                 img = Image.open(io.BytesIO(pix.tobytes("png")))
                 text = pytesseract.image_to_string(
