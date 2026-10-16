@@ -100,6 +100,11 @@ COLORS = {
 def get_conn():
     dsn = os.getenv("POSTGRES_DSN")
     if not dsn:
+        try:
+            dsn = st.secrets["postgres"]["dsn"]
+        except Exception:
+            pass
+    if not dsn:
         return None
     try:
         conn = psycopg2.connect(dsn)

@@ -18,6 +18,15 @@ from utils.abstention_guard import check_pre_retrieval_abstention
 load_dotenv()
 
 
+def _get_secret(section: str, key: str) -> str:
+    """Read a value from st.secrets (Streamlit Cloud), returning '' on any failure."""
+    try:
+        import streamlit as st
+        return st.secrets[section][key] or ""
+    except Exception:
+        return ""
+
+
 class RAGGenerator:
 
   def __init__(
@@ -26,9 +35,9 @@ class RAGGenerator:
       model_name: str = "openai/gpt-oss-20b",
       xbrl_retriever: Optional[XBRLRetriever] = None,
   ):
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY") or _get_secret("app", "groq_api_key")
     if not api_key:
-      raise ValueError("GROQ_API_KEY not found. Please set it in your .env file.")
+      raise ValueError("GROQ_API_KEY not found. Set GROQ_API_KEY env var or add groq_api_key under [app] in .streamlit/secrets.toml.")
 
     self.retriever = retriever or Retriever()
     self.model_name = model_name
@@ -38,7 +47,7 @@ class RAGGenerator:
     # Auto-initializes if POSTGRES_DSN is set; silently disabled otherwise.
     if xbrl_retriever is not None:
       self.xbrl_retriever: Optional[XBRLRetriever] = xbrl_retriever
-    elif os.getenv("POSTGRES_DSN"):
+    elif os.getenv("POSTGRES_DSN") or _get_secret("postgres", "dsn"):
       try:
         self.xbrl_retriever = XBRLRetriever()
       except Exception:
