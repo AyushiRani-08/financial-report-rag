@@ -1,5 +1,5 @@
 [server]
-fileWatcherType = "none"
+fileWatcherType = "auto"
 headless = true
 enableWebsocketCompression = false
 # Bind to all interfaces (required for Streamlit Cloud container routing)

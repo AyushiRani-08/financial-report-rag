@@ -1,51 +1,25 @@
 """
 retrieval/xbrl_retriever.py
 Query structured financial facts from PostgreSQL to augment RAG prompts.
-Uses the normalized schema: companies → filings → financial_facts.
+Uses the normalized schema: companies -> filings -> financial_facts.
 """
-
 import os
 import logging
+import threading
+import time
 from typing import Optional
 
 from dotenv import load_dotenv
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
+
+from utils.canonical_map import DEFAULT_CANONICAL_FIELDS
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Core investor-facing facts to surface in RAG context
-DEFAULT_CANONICAL_FIELDS = [
-    "revenue",
-    "gross_profit",
-    "cost_of_revenue",
-    "operating_income",
-    "operating_expenses",
-    "rd_expense",
-    "sga_expense",
-    "pretax_income",
-    "income_tax_expense",
-    "net_income",
-    "eps_basic",
-    "eps_diluted",
-    "shares_outstanding",
-    "total_assets",
-    "current_assets",
-    "cash",
-    "cash_and_investments",
-    "total_liabilities",
-    "current_liabilities",
-    "long_term_debt",
-    "stockholders_equity",
-    "operating_cash_flow",
-    "investing_cash_flow",
-    "financing_cash_flow",
-    "capex",
-    "share_repurchases",
-    "dividends_paid",
-]
 
 
 class XBRLRetriever:
@@ -56,20 +30,25 @@ class XBRLRetriever:
 
     def __init__(self, dsn: Optional[str] = None):
         self.dsn = dsn or os.environ["POSTGRES_DSN"]
+        # Initialize a thread‑safe connection pool (min 1, max 5 connections)
+        self._pool = psycopg2.pool.ThreadedConnectionPool(1, 5, dsn=self.dsn)
         self._conn: Optional[psycopg2.extensions.connection] = None
 
     @property
     def conn(self) -> psycopg2.extensions.connection:
-        """Lazy connection with auto-reconnect and transaction rollback on error."""
-        if self._conn is None or self._conn.closed:
-            self._conn = psycopg2.connect(self.dsn)
-        elif self._conn.get_transaction_status() == psycopg2.extensions.TRANSACTION_STATUS_INERROR:
-            self._conn.rollback()
-        return self._conn
+        """Obtain a connection from the pool. Caller must return it via self._pool.putconn()."""
+        conn = self._pool.getconn()
+        # Ensure the connection is healthy; reconnect if needed
+        if conn.closed:
+            conn = self._pool.getconn()
+        elif conn.get_transaction_status() == psycopg2.extensions.TRANSACTION_STATUS_INERROR:
+            conn.rollback()
+        return conn
 
     def close(self):
-        if self._conn and not self._conn.closed:
-            self._conn.close()
+        # Close all pooled connections gracefully
+        if hasattr(self, "_pool"):
+            self._pool.closeall()
 
     # ------------------------------------------------------------------
     # Core query methods
@@ -149,30 +128,34 @@ class XBRLRetriever:
             ORDER BY fi.fiscal_period DESC, ff.canonical_field
         """
 
+        conn = self.conn
         try:
-            with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(query, params)
                 return [dict(row) for row in cur.fetchall()]
-        except Exception:
-            if self._conn and not self._conn.closed:
-                self._conn.rollback()
-            raise
+        finally:
+            # Return the connection to the pool
+            self._pool.putconn(conn)
 
     def get_available_periods(self, ticker: str) -> list[str]:
         """Return all fiscal periods available for a ticker, newest first."""
         try:
-            with self.conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT DISTINCT fi.fiscal_period
-                    FROM filings fi
-                    JOIN companies c ON c.company_id = fi.company_id
-                    WHERE c.ticker = %s
-                    ORDER BY fi.fiscal_period DESC
-                    """,
-                    (ticker,),
-                )
-                return [row[0] for row in cur.fetchall()]
+            conn = self.conn
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT DISTINCT fi.fiscal_period
+                        FROM filings fi
+                        JOIN companies c ON c.company_id = fi.company_id
+                        WHERE c.ticker = %s
+                        ORDER BY fi.fiscal_period DESC
+                        """,
+                        (ticker,),
+                    )
+                    return [row[0] for row in cur.fetchall()]
+            finally:
+                self._pool.putconn(conn)
         except Exception:
             if self._conn and not self._conn.closed:
                 self._conn.rollback()
@@ -181,11 +164,15 @@ class XBRLRetriever:
     def get_available_tickers(self) -> list[dict]:
         """Return all indexed companies with their market and sector."""
         try:
-            with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT ticker, name, market, sector FROM companies ORDER BY ticker"
-                )
-                return [dict(row) for row in cur.fetchall()]
+            conn = self.conn
+            try:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(
+                        "SELECT ticker, name, market, sector FROM companies ORDER BY ticker"
+                    )
+                    return [dict(row) for row in cur.fetchall()]
+            finally:
+                self._pool.putconn(conn)
         except Exception:
             if self._conn and not self._conn.closed:
                 self._conn.rollback()

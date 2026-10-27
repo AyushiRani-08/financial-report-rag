@@ -11,6 +11,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from indexing.embedder import Embedder
 from indexing.vector_store import VectorStore
+from retrieval.reranker import LocalReranker
 
 
 class Retriever:
@@ -21,6 +22,7 @@ class Retriever:
         collection_name: str = "papers",
         user_id: Optional[str] = None,
         vector_store: Optional[VectorStore] = None,
+        reranker: Optional[LocalReranker] = None,
     ):
         if vector_store is not None:
             self.vector_store = vector_store
@@ -31,6 +33,7 @@ class Retriever:
                 user_id=user_id,
             )
         self.embedder = self.vector_store.embedder
+        self.reranker = reranker or LocalReranker()
         # Expose collection for legacy callers
         self.collection = self.vector_store.collection
 
@@ -47,17 +50,20 @@ class Retriever:
         where_override: dict | None = None,
     ) -> List[Dict[str, Any]]:
         """
-        Returns the top_k most relevant chunks for the query.
-
-        Supports statement_scope ('consolidated' vs 'standalone').
+        Returns the top_k most relevant chunks for the query using two-stage retrieval:
+        1. Fetch candidate pool (up to 15 chunks) from VectorStore via cosine similarity.
+        2. Rerank candidates with FlashRank Cross-Encoder to select the top_k.
         """
         # 1. Embed query
         query_vector = self.embedder.embed_query(query).tolist()
 
+        # Candidate pool: fetch more candidates so re-ranker has high-quality selection
+        candidate_k = max(top_k * 4, 15)
+
         # 2. Primary search with all filters
         chunks = self.vector_store.query(
             query_vector=query_vector,
-            top_k=top_k,
+            top_k=candidate_k,
             paper_id=paper_id,
             ticker=ticker,
             fiscal_period=fiscal_period,
@@ -68,7 +74,7 @@ class Retriever:
         if not chunks and statement_scope:
             chunks = self.vector_store.query(
                 query_vector=query_vector,
-                top_k=top_k,
+                top_k=candidate_k,
                 paper_id=paper_id,
                 ticker=ticker,
                 fiscal_period=fiscal_period,
@@ -78,12 +84,16 @@ class Retriever:
         if not chunks and fiscal_period and ticker and not paper_id:
             chunks = self.vector_store.query(
                 query_vector=query_vector,
-                top_k=top_k,
+                top_k=candidate_k,
                 paper_id=None,
                 ticker=ticker,
                 fiscal_period=None,
                 statement_scope=None,
             )
+
+        # 4. Re-rank candidate chunks down to top_k using FlashRank cross-encoder
+        if chunks:
+            chunks = self.reranker.rerank(query=query, chunks=chunks, top_k=top_k)
 
         return chunks
 
@@ -94,6 +104,6 @@ if __name__ == "__main__":
     print(f"Query: '{test_query}'\n")
     results = retriever.retrieve(query=test_query, top_k=2)
     for rank, item in enumerate(results, start=1):
-        print(f"--- Rank {rank} (Score: {item['similarity_score']}) ---")
-        print(f"Page: {item['metadata']['page_number']}")
+        print(f"--- Rank {rank} (Vector Cosine: {item['similarity_score']} | Rerank Score: {item.get('rerank_score', 'N/A')}) ---")
+        print(f"Page: {item['metadata'].get('page_number', 'N/A')}")
         print(f"Text: {item['text'][:200]}...\n")

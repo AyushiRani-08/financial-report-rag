@@ -57,6 +57,7 @@ class _SupabaseBackend:
     def __init__(self, user_id: Optional[str] = None):
         import psycopg2
         import psycopg2.extras
+        from psycopg2 import pool
         self._psycopg2 = psycopg2
         self._extras = psycopg2.extras
         self.dsn = (
@@ -65,15 +66,18 @@ class _SupabaseBackend:
             or ""
         )
         self.user_id = user_id
+        # Initialize a thread‑safe connection pool (min 1, max 5 connections)
+        self.pool = pool.ThreadedConnectionPool(minconn=1, maxconn=5, dsn=self.dsn)
+        # Keep a fallback for legacy code (not used after pooling)
         self._conn = None
 
-    @property
-    def conn(self):
-        if self._conn is None or self._conn.closed:
-            self._conn = self._psycopg2.connect(self.dsn)
-        elif self._conn.get_transaction_status() == self._psycopg2.extensions.TRANSACTION_STATUS_INERROR:
-            self._conn.rollback()
-        return self._conn
+    def _get_conn(self):
+        """Acquire a connection from the pool. Caller must ensure the connection is returned via `self.pool.putconn(conn)`."""
+        conn = self.pool.getconn()
+        # Reset any error state before use
+        if conn.get_transaction_status() == self._psycopg2.extensions.TRANSACTION_STATUS_INERROR:
+            conn.rollback()
+        return conn
 
     def upsert(self, chunks: list[dict], user_id: str, paper_id: str,
                ticker: str, fiscal_period: str, form_type: str, ext: str):
@@ -92,8 +96,9 @@ class _SupabaseBackend:
                 word_count    = EXCLUDED.word_count
         """
         try:
-            with self.conn:
-                with self.conn.cursor() as cur:
+            conn = self._get_conn()
+            try:
+                with conn.cursor() as cur:
                     for c in chunks:
                         cur.execute(sql, (
                             f"{paper_id}_chunk_{c['chunk_id']}",
@@ -108,60 +113,74 @@ class _SupabaseBackend:
                             c["text"],
                             str(c["embedding"].tolist()),
                         ))
+                conn.commit()
+            finally:
+                self.pool.putconn(conn)
         except Exception:
-            if self._conn and not self._conn.closed:
-                self._conn.rollback()
+            # No persistent self._conn, so just raise after ensuring any open connection is returned
             raise
 
     def delete(self, paper_id: str, user_id: str) -> int:
         if not _is_valid_uuid(user_id):
             return 0
         try:
-            with self.conn:
-                with self.conn.cursor() as cur:
+            conn = self._get_conn()
+            try:
+                with conn.cursor() as cur:
                     cur.execute(
                         "DELETE FROM public.embeddings WHERE paper_id=%s AND user_id=%s",
                         (paper_id, user_id),
                     )
-                    return cur.rowcount
+                    rowcount = cur.rowcount
+                conn.commit()
+                return rowcount
+            finally:
+                self.pool.putconn(conn)
         except Exception:
-            if self._conn and not self._conn.closed:
-                self._conn.rollback()
             raise
 
     def list_documents(self, user_id: str) -> list[str]:
         if not _is_valid_uuid(user_id):
             return []
         try:
-            with self.conn.cursor() as cur:
-                cur.execute(
-                    "SELECT DISTINCT paper_id FROM public.embeddings WHERE user_id=%s ORDER BY paper_id",
-                    (user_id,),
-                )
-                return [r[0] for r in cur.fetchall()]
+            conn = self._get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT DISTINCT paper_id FROM public.embeddings WHERE user_id=%s ORDER BY paper_id",
+                        (user_id,),
+                    )
+                    result = [r[0] for r in cur.fetchall()]
+                return result
+            finally:
+                self.pool.putconn(conn)
         except Exception:
-            if self._conn and not self._conn.closed:
-                self._conn.rollback()
             raise
 
     def count(self, user_id: str) -> int:
         if not _is_valid_uuid(user_id):
             return 0
         try:
-            with self.conn.cursor() as cur:
-                cur.execute(
-                    "SELECT COUNT(*) FROM public.embeddings WHERE user_id=%s",
-                    (user_id,),
-                )
-                return cur.fetchone()[0]
+            conn = self._get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT COUNT(*) FROM public.embeddings WHERE user_id=%s",
+                        (user_id,),
+                    )
+                    count = cur.fetchone()[0]
+                return count
+            finally:
+                self.pool.putconn(conn)
         except Exception:
-            if self._conn and not self._conn.closed:
-                self._conn.rollback()
             raise
 
     def query(self, query_vector: list[float], top_k: int, user_id: str,
               paper_id: Optional[str] = None, ticker: Optional[str] = None,
-              fiscal_period: Optional[str] = None) -> list[dict]:
+              fiscal_period: Optional[str] = None,
+              statement_scope: Optional[str] = None) -> list[dict]:
+        # statement_scope is accepted for API parity but not stored in this table.
+        # The pgvector embeddings table uses content-level metadata instead.
         """Cosine similarity search with optional metadata filters."""
         if not _is_valid_uuid(user_id):
             print(f"[VectorStore] skipping query — invalid user_id: '{user_id}' (not authenticated)")
@@ -202,12 +221,14 @@ class _SupabaseBackend:
         params_full = [vec_str] + params + [vec_str, top_k]
 
         try:
-            with self.conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
-                cur.execute(sql, params_full)
-                rows = cur.fetchall()
+            conn = self._get_conn()
+            try:
+                with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
+                    cur.execute(sql, params_full)
+                    rows = cur.fetchall()
+            finally:
+                self.pool.putconn(conn)
         except Exception:
-            if self._conn and not self._conn.closed:
-                self._conn.rollback()
             raise
 
         results = []

@@ -6,6 +6,7 @@ SEC APIs used (free, no auth):
   Ticker->CIK : https://www.sec.gov/files/company_tickers.json
   Facts JSON  : https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json
 """
+
 import os
 import logging
 from pathlib import Path
@@ -24,45 +25,9 @@ EDGAR_HEADERS = {
     "Accept-Encoding": "gzip, deflate",
 }
 
-# US-GAAP tag -> normalized canonical field
-CANONICAL_MAP = {
-    "Revenues": "revenue",
-    "RevenueFromContractWithCustomerExcludingAssessedTax": "revenue",
-    "SalesRevenueNet": "revenue",
-    "RevenueFromContractWithCustomerIncludingAssessedTax": "revenue",
-    "GrossProfit": "gross_profit",
-    "CostOfRevenue": "cost_of_revenue",
-    "CostOfGoodsAndServicesSold": "cost_of_revenue",
-    "OperatingIncomeLoss": "operating_income",
-    "OperatingExpenses": "operating_expenses",
-    "ResearchAndDevelopmentExpense": "rd_expense",
-    "SellingGeneralAndAdministrativeExpense": "sga_expense",
-    "NetIncomeLoss": "net_income",
-    "ProfitLoss": "net_income",
-    "IncomeTaxExpenseBenefit": "income_tax_expense",
-    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest": "pretax_income",
-    "EarningsPerShareBasic": "eps_basic",
-    "EarningsPerShareDiluted": "eps_diluted",
-    "Assets": "total_assets",
-    "AssetsCurrent": "current_assets",
-    "CashAndCashEquivalentsAtCarryingValue": "cash",
-    "PropertyPlantAndEquipmentNet": "ppe_net",
-    "Goodwill": "goodwill",
-    "InventoryNet": "inventory",
-    "AccountsReceivableNetCurrent": "accounts_receivable",
-    "Liabilities": "total_liabilities",
-    "LiabilitiesCurrent": "current_liabilities",
-    "LongTermDebt": "long_term_debt",
-    "LongTermDebtNoncurrent": "long_term_debt",
-    "StockholdersEquity": "stockholders_equity",
-    "NetCashProvidedByUsedInOperatingActivities": "operating_cash_flow",
-    "NetCashProvidedByUsedInInvestingActivities": "investing_cash_flow",
-    "NetCashProvidedByUsedInFinancingActivities": "financing_cash_flow",
-    "PaymentsToAcquirePropertyPlantAndEquipment": "capex",
-    "PaymentsForRepurchaseOfCommonStock": "share_repurchases",
-    "PaymentsOfDividendsCommonStock": "dividends_paid",
-    "PaymentsOfDividends": "dividends_paid",
-}
+# US-GAAP tag -> normalized canonical field (single source of truth)
+from utils.canonical_map import CANONICAL_MAP
+
 
 
 COMPANY_ALIASES = {

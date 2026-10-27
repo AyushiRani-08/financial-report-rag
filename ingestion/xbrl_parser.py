@@ -30,92 +30,9 @@ NS = {
 }
 
 # ── Raw US-GAAP tag → normalized canonical field ──────────────────────────────
-CANONICAL_MAP: dict[str, str] = {
-    # Revenue & Sales
-    "Revenues":                                           "revenue",
-    "RevenueFromContractWithCustomerExcludingAssessedTax": "revenue",
-    "SalesRevenueNet":                                    "revenue",
-    "RevenueFromContractWithCustomerIncludingAssessedTax": "revenue",
+# Canonical tag -> field mapping (single source of truth)
+from utils.canonical_map import CANONICAL_MAP
 
-    # Cost of Sales & Gross Profit
-    "GrossProfit":                                        "gross_profit",
-    "CostOfRevenue":                                      "cost_of_revenue",
-    "CostOfGoodsAndServicesSold":                         "cost_of_revenue",
-    "CostOfGoodsSold":                                    "cost_of_revenue",
-
-    # Operating Income & Expenses
-    "OperatingIncomeLoss":                                "operating_income",
-    "OperatingExpenses":                                  "operating_expenses",
-    "ResearchAndDevelopmentExpense":                      "rd_expense",
-    "SellingGeneralAndAdministrativeExpense":             "sga_expense",
-    "SellingAndMarketingExpense":                         "marketing_expense",
-    "GeneralAndAdministrativeExpense":                    "ga_expense",
-
-    # Pre-tax, Taxes & Net Income
-    "NetIncomeLoss":                                      "net_income",
-    "ProfitLoss":                                         "net_income",
-    "NetIncomeLossAvailableToCommonStockholdersBasic":     "net_income",
-    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments": "pretax_income",
-    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest": "pretax_income",
-    "IncomeTaxExpenseBenefit":                            "income_tax_expense",
-    "InterestExpense":                                    "interest_expense",
-    "InterestAndDebtExpense":                             "interest_expense",
-    "InterestIncomeExpenseNet":                           "interest_income",
-    "InvestmentIncomeNonoperating":                       "interest_income",
-    "DepreciationDepletionAndAmortization":               "depreciation_amortization",
-    "DepreciationAndAmortization":                        "depreciation_amortization",
-    "Depreciation":                                       "depreciation_amortization",
-    "AmortizationOfIntangibleAssets":                     "depreciation_amortization",
-
-    # EPS & Shares
-    "EarningsPerShareBasic":                              "eps_basic",
-    "EarningsPerShareDiluted":                            "eps_diluted",
-    "CommonStockSharesOutstanding":                       "shares_outstanding",
-    "WeightedAverageNumberOfSharesOutstandingBasic":      "weighted_avg_shares_basic",
-    "WeightedAverageNumberOfDilutedSharesOutstanding":    "weighted_avg_shares_diluted",
-    "EntityCommonStockSharesOutstanding":                 "shares_outstanding",
-
-    # Balance Sheet — Assets
-    "Assets":                                             "total_assets",
-    "AssetsCurrent":                                      "current_assets",
-    "CashAndCashEquivalentsAtCarryingValue":              "cash",
-    "CashCashEquivalentsAndShortTermInvestments":         "cash_and_investments",
-    "MarketableSecuritiesCurrent":                        "short_term_investments",
-    "AvailableForSaleSecuritiesCurrent":                  "short_term_investments",
-    "AccountsReceivableNetCurrent":                       "accounts_receivable",
-    "InventoryNet":                                       "inventory",
-    "PropertyPlantAndEquipmentNet":                       "ppe_net",
-    "Goodwill":                                           "goodwill",
-    "IntangibleAssetsNetExcludingGoodwill":               "intangible_assets",
-    "FiniteLivedIntangibleAssetsNet":                     "intangible_assets",
-    "DeferredTaxAssetsNet":                               "deferred_tax_assets",
-    "DeferredIncomeTaxAssetsNet":                         "deferred_tax_assets",
-
-    # Balance Sheet — Liabilities & Equity
-    "Liabilities":                                        "total_liabilities",
-    "LiabilitiesCurrent":                                 "current_liabilities",
-    "AccountsPayableCurrent":                             "accounts_payable",
-    "CommercialPaper":                                    "commercial_paper",
-    "LongTermDebt":                                       "long_term_debt",
-    "LongTermDebtNoncurrent":                             "long_term_debt",
-    "LongTermDebtCurrent":                                "short_term_debt",
-    "DeferredTaxLiabilitiesNoncurrent":                   "deferred_tax_liabilities",
-    "DeferredIncomeTaxLiabilitiesNet":                    "deferred_tax_liabilities",
-    "StockholdersEquity":                                 "stockholders_equity",
-    "RetainedEarningsAccumulatedDeficit":                 "retained_earnings",
-    "LiabilitiesAndStockholdersEquity":                   "total_liabilities_equity",
-
-    # Cash Flow & Capital Allocation
-    "NetCashProvidedByUsedInOperatingActivities":         "operating_cash_flow",
-    "NetCashProvidedByUsedInInvestingActivities":         "investing_cash_flow",
-    "NetCashProvidedByUsedInFinancingActivities":         "financing_cash_flow",
-    "PaymentsToAcquirePropertyPlantAndEquipment":         "capex",
-    "PaymentsToAcquireProductiveAssets":                  "capex",
-    "PaymentsForRepurchaseOfCommonStock":                 "share_repurchases",
-    "PaymentsToAcquireCommonStock":                       "share_repurchases",
-    "PaymentsOfDividendsCommonStock":                     "dividends_paid",
-    "PaymentsOfDividends":                                "dividends_paid",
-}
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

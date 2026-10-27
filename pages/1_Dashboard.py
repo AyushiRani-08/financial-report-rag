@@ -13,66 +13,21 @@ import psycopg2.extras
 import pandas as pd
 from dotenv import load_dotenv
 
-from auth.session import require_auth, render_sidebar_user
+from auth.session import require_auth, render_sidebar_user, logout
+from ui import apply_theme, render_settings_section
 
 load_dotenv()
 
-
+# ── Clean Theme Styles (Light & Dark Support) ─────────────────────────────
+apply_theme()
 
 # ── Auth Gate ─────────────────────────────────────────────────────────────
 current_user = require_auth()
 render_sidebar_user(current_user, page_key="dashboard")
 
-# ── Formal Dark Theme Styles ──────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-* { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
-.stApp { background-color: #0b0f19 !important; color: #f1f5f9 !important; }
-header[data-testid="stHeader"] { background: transparent !important; }
-[data-testid="stSidebar"] { background-color: #111827 !important; border-right: 1px solid rgba(255, 255, 255, 0.08) !important; }
+with st.sidebar:
+    render_settings_section(on_logout=logout)
 
-[data-testid="stMetric"] {
-    background: #151d2d !important;
-    border: 1px solid rgba(255, 255, 255, 0.08) !important;
-    border-radius: 6px !important;
-    padding: 0.75rem 0.95rem !important;
-}
-[data-testid="stMetricValue"] {
-    color: #f8fafc !important;
-    font-weight: 600 !important;
-    font-size: 1.35rem !important;
-}
-[data-testid="stMetricLabel"] {
-    color: #94a3b8 !important;
-    font-size: 0.76rem !important;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-}
-
-.dash-header {
-    font-size: 1.5rem;
-    font-weight: 700;
-    color: #f8fafc;
-    letter-spacing: -0.02em;
-    margin-bottom: 0.2rem;
-}
-.dash-sub {
-    font-size: 0.85rem;
-    color: #94a3b8;
-    margin-bottom: 1.25rem;
-}
-.section-heading {
-    font-size: 0.95rem;
-    font-weight: 600;
-    color: #e2e8f0;
-    margin-top: 1rem;
-    margin-bottom: 0.75rem;
-    letter-spacing: -0.01em;
-}
-hr { border-color: rgba(255, 255, 255, 0.08) !important; margin: 1.25rem 0 !important; }
-</style>
-""", unsafe_allow_html=True)
 
 PLOTLY_THEME = dict(
     paper_bgcolor="rgba(0,0,0,0)",

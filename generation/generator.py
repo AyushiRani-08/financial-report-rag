@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 import logging
 from pathlib import Path
 import sys
@@ -14,8 +15,112 @@ from retrieval.xbrl_retriever import XBRLRetriever
 from utils.logger import log_query, Timer
 from utils.metadata_parser import parse_filing_metadata, COMPANY_TICKER_MAP
 from utils.abstention_guard import check_pre_retrieval_abstention
+from visualization import (
+    extract_chart,
+    get_display_text,
+    CHART_INSTRUCTION,
+    enrich_chart_with_xbrl,
+)
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────────────────────
+# Rate Limiter  –  simple token-bucket, one bucket per session_id
+# Default: 60 requests per 60-second window (1 req/s burst-free)
+# ──────────────────────────────────────────────────────────────
+_RATE_LIMIT_CAPACITY = int(os.getenv("GROQ_RATE_LIMIT_RPM", "60"))  # tokens = max requests per window
+_RATE_LIMIT_WINDOW   = 60.0  # seconds
+_rate_buckets: Dict[str, Dict] = {}  # session_id → {tokens, last_refill}
+_rate_lock = threading.Lock()
+
+
+def _check_rate_limit(session_id: str) -> None:
+    """Raise RuntimeError if this session has exceeded the Groq rate limit."""
+    if not session_id:
+        return
+    with _rate_lock:
+        now = time.monotonic()
+        bucket = _rate_buckets.setdefault(
+            session_id, {"tokens": float(_RATE_LIMIT_CAPACITY), "last_refill": now}
+        )
+        elapsed = now - bucket["last_refill"]
+        # Refill proportionally to elapsed time
+        refill = elapsed * (_RATE_LIMIT_CAPACITY / _RATE_LIMIT_WINDOW)
+        bucket["tokens"] = min(float(_RATE_LIMIT_CAPACITY), bucket["tokens"] + refill)
+        bucket["last_refill"] = now
+
+        if bucket["tokens"] < 1.0:
+            wait_s = (1.0 - bucket["tokens"]) * (_RATE_LIMIT_WINDOW / _RATE_LIMIT_CAPACITY)
+            raise RuntimeError(
+                f"Rate limit exceeded for session '{session_id}'. "
+                f"Please wait ~{wait_s:.1f}s before sending another request."
+            )
+        bucket["tokens"] -= 1.0
+
+
+# ──────────────────────────────────────────────────────────────
+# Circuit Breaker  –  one breaker per model name
+# Opens after FAILURE_THRESHOLD consecutive failures;
+# enters half-open after RECOVERY_TIMEOUT seconds.
+# ──────────────────────────────────────────────────────────────
+_CB_FAILURE_THRESHOLD = int(os.getenv("GROQ_CB_FAILURE_THRESHOLD", "5"))
+_CB_RECOVERY_TIMEOUT  = float(os.getenv("GROQ_CB_RECOVERY_TIMEOUT", "60"))
+
+class _CircuitState:
+    CLOSED    = "CLOSED"     # normal – calls pass through
+    OPEN      = "OPEN"       # tripped – calls are blocked
+    HALF_OPEN = "HALF_OPEN"  # probing – one call allowed through
+
+_circuit_breakers: Dict[str, Dict] = {}
+_cb_lock = threading.Lock()
+
+
+def _cb_get(model: str) -> Dict:
+    with _cb_lock:
+        return _circuit_breakers.setdefault(
+            model,
+            {"state": _CircuitState.CLOSED, "failures": 0, "opened_at": 0.0}
+        )
+
+
+def _cb_allow(model: str) -> bool:
+    """Return True if the circuit allows a call to model."""
+    cb = _cb_get(model)
+    with _cb_lock:
+        if cb["state"] == _CircuitState.CLOSED:
+            return True
+        if cb["state"] == _CircuitState.OPEN:
+            if time.monotonic() - cb["opened_at"] >= _CB_RECOVERY_TIMEOUT:
+                cb["state"] = _CircuitState.HALF_OPEN
+                logger.info("[CircuitBreaker] %s → HALF_OPEN (probing)", model)
+                return True
+            return False
+        # HALF_OPEN: allow one probe
+        return True
+
+
+def _cb_record_success(model: str) -> None:
+    cb = _cb_get(model)
+    with _cb_lock:
+        cb["failures"] = 0
+        if cb["state"] != _CircuitState.CLOSED:
+            logger.info("[CircuitBreaker] %s → CLOSED (recovered)", model)
+        cb["state"] = _CircuitState.CLOSED
+
+
+def _cb_record_failure(model: str) -> None:
+    cb = _cb_get(model)
+    with _cb_lock:
+        cb["failures"] += 1
+        if cb["state"] == _CircuitState.HALF_OPEN or cb["failures"] >= _CB_FAILURE_THRESHOLD:
+            cb["state"]     = _CircuitState.OPEN
+            cb["opened_at"] = time.monotonic()
+            logger.warning(
+                "[CircuitBreaker] %s → OPEN after %d failure(s). Will retry in %.0fs.",
+                model, cb["failures"], _CB_RECOVERY_TIMEOUT
+            )
 
 
 def _get_secret(section: str, key: str) -> str:
@@ -41,7 +146,7 @@ class RAGGenerator:
 
     self.retriever = retriever or Retriever()
     self.model_name = model_name
-    self.client = Groq(api_key=api_key)
+    self.client = Groq(api_key=api_key, timeout=120.0)
 
     # Optional: structured XBRL retriever backed by PostgreSQL.
     # Auto-initializes if POSTGRES_DSN is set; silently disabled otherwise.
@@ -55,11 +160,12 @@ class RAGGenerator:
     else:
       self.xbrl_retriever = None
 
-  # Models tried in order when the primary is at capacity (503/429)
+  # Models tried in order when the primary is at capacity, times out, or fails
   _FALLBACK_MODELS = [
+      "qwen/qwen3.8-27b",
+      "openai/gpt-oss-120b",
       "llama-3.3-70b-versatile",
       "llama-3.1-8b-instant",
-      "gemma2-9b-it",
   ]
 
   def _call_llm(
@@ -67,47 +173,65 @@ class RAGGenerator:
       messages: list,
       temperature: float = 0.1,
       max_retries: int = 3,
+      session_id: Optional[str] = None,
   ) -> str:
       """
       Wraps client.chat.completions.create with:
+      • Per-session token-bucket rate limiting (60 req/min by default)
+      • Per-model circuit breaker (opens after 5 failures, resets after 60s)
       • Exponential-backoff retry (3 attempts, 2s / 4s / 8s)
-      • Automatic fallback to alternative models on 503 / 429
+      • Automatic fallback to alternative models on 503 / 429 / timeout
 
       Returns the final answer string.
       """
+      # Guard: enforce per-session rate limit before any API call
+      _check_rate_limit(session_id or "")
+
       models_to_try = [self.model_name] + [
           m for m in self._FALLBACK_MODELS if m != self.model_name
       ]
 
       last_exc = None
       for model in models_to_try:
+          # Skip immediately if the circuit is open for this model
+          if not _cb_allow(model):
+              logger.warning("[CircuitBreaker] %s is OPEN — skipping.", model)
+              continue
+
           for attempt in range(max_retries):
               try:
                   resp = self.client.chat.completions.create(
                       model=model,
                       messages=messages,
                       temperature=temperature,
+                      max_tokens=4096,
                   )
                   content = resp.choices[0].message.content
+                  _cb_record_success(model)
                   if model != self.model_name:
-                      logging.getLogger(__name__).warning(
-                          f"[Generator] Primary model '{self.model_name}' unavailable — "
-                          f"used fallback '{model}' (attempt {attempt+1})"
+                      logger.warning(
+                          "[Generator] Primary model '%s' unavailable — "
+                          "used fallback '%s' (attempt %d)",
+                          self.model_name, model, attempt + 1,
                       )
                   return content or ""
               except Exception as exc:
                   last_exc = exc
                   err_str = str(exc).lower()
-                  is_capacity = any(code in err_str for code in ["503", "429", "capacity", "overloaded", "rate"])
-                  if is_capacity and attempt < max_retries - 1:
+                  is_recoverable = any(
+                      code in err_str
+                      for code in ["503", "429", "capacity", "overloaded", "rate", "timeout", "timed out", "connection"]
+                  )
+                  _cb_record_failure(model)
+                  if is_recoverable and attempt < max_retries - 1:
                       wait = 2 ** (attempt + 1)   # 2s, 4s, 8s
-                      logging.getLogger(__name__).warning(
-                          f"[Generator] {model} returned capacity error — retrying in {wait}s "
-                          f"(attempt {attempt+1}/{max_retries})"
+                      logger.warning(
+                          "[Generator] %s returned retryable error (%s) — retrying in %ds (attempt %d/%d)",
+                          model, exc, wait, attempt + 1, max_retries,
                       )
                       time.sleep(wait)
                   else:
-                      break   # non-capacity error or exhausted retries → try next model
+                      break   # non-recoverable or exhausted → try next model
 
       raise RuntimeError(
           f"All models exhausted. Last error: {last_exc}"
@@ -117,39 +241,57 @@ class RAGGenerator:
       self,
       messages: list,
       temperature: float = 0.1,
+      session_id: Optional[str] = None,
   ):
       """
-      Streams tokens from the LLM, falling back across models on 503/429.
+      Streams tokens from the LLM, falling back across models on 503/429/timeout.
+      Integrates per-session rate limiting and per-model circuit breaker.
       Yields string token chunks as they arrive from the Groq API.
       """
+      # Guard: enforce per-session rate limit before any streaming call
+      _check_rate_limit(session_id or "")
+
       models_to_try = [self.model_name] + [
           m for m in self._FALLBACK_MODELS if m != self.model_name
       ]
+      last_exc = None
       for model in models_to_try:
+          if not _cb_allow(model):
+              logger.warning("[CircuitBreaker] %s is OPEN — skipping (stream).", model)
+              continue
+
+          tokens_yielded = False
           try:
               stream = self.client.chat.completions.create(
                   model=model,
                   messages=messages,
                   temperature=temperature,
                   stream=True,
+                  max_tokens=4096,
               )
               for chunk in stream:
                   delta = chunk.choices[0].delta.content
                   if delta:
+                      tokens_yielded = True
                       yield delta
+              _cb_record_success(model)
               return  # streaming finished successfully
           except Exception as exc:
+              last_exc = exc
+              _cb_record_failure(model)
               err_str = str(exc).lower()
-              is_capacity = any(
-                  c in err_str for c in ["503", "429", "capacity", "overloaded", "rate"]
+              is_recoverable = any(
+                  c in err_str
+                  for c in ["503", "429", "capacity", "overloaded", "rate", "timeout", "timed out", "connection"]
               )
-              if is_capacity:
-                  logging.getLogger(__name__).warning(
-                      f"[Generator] {model} capacity error during stream — trying next model."
+              if not tokens_yielded and is_recoverable:
+                  logger.warning(
+                      "[Generator] %s encountered recoverable error (%s) before streaming — trying fallback.",
+                      model, exc,
                   )
                   continue
               raise
-      raise RuntimeError("All models exhausted during streaming.")
+      raise RuntimeError(f"All models exhausted during streaming. Last error: {last_exc}")
 
   def format_context(self, retrieved_chunks: List[Dict[str, Any]]) -> str:
     """Formats retrieved chunks with citations into a unified context block."""
@@ -305,7 +447,8 @@ class RAGGenerator:
         "### 💡 What Does This Mean for an Investor?\n"
         "• 🟢 **Positive Signals**: 1-2 concise bullet points highlighting financial strengths, margin expansion, or capital returns shown in the data.\n"
         "• 🟡 **Things to Monitor**: 1-2 concise bullet points highlighting key operational risks, cost pressures, or trends to watch.\n"
-        "• 📌 **Key Takeaway**: One sentence summarizing the overall implication for shareholders."
+        "• 📌 **Key Takeaway**: One sentence summarizing the overall implication for shareholders.\n\n"
+        f"{CHART_INSTRUCTION}"
     )
 
     user_prompt = f"""{xbrl_section}CONTEXT FROM FINANCIAL REPORT:
@@ -330,6 +473,12 @@ ANALYST RESPONSE:"""
         answer = "I was unable to generate a response. Please try rephrasing your question or check that the correct document is selected."
     total_ms = (time.perf_counter() - total_start) * 1000
 
+    chart_data = extract_chart(answer)
+    if chart_data and self.xbrl_retriever and active_ticker:
+        chart_data = enrich_chart_with_xbrl(chart_data, self.xbrl_retriever, active_ticker)
+
+    clean_answer = get_display_text(answer) if chart_data else answer
+
     # --- Log the query ---
     log_query(
         query=query, query_type="qa", paper_id=paper_id, top_k=top_k,
@@ -337,10 +486,10 @@ ANALYST RESPONSE:"""
         retrieval_latency_ms=retrieval_timer.elapsed_ms,
         llm_latency_ms=llm_timer.elapsed_ms,
         total_latency_ms=total_ms,
-        model_name=self.model_name, answer_length=len(answer),
+        model_name=self.model_name, answer_length=len(clean_answer),
     )
 
-    return {"answer": answer, "sources": chunks}
+    return {"answer": clean_answer, "sources": chunks, "chart_data": chart_data}
 
   def generate_answer_stream(
       self,
@@ -351,11 +500,12 @@ ANALYST RESPONSE:"""
       fiscal_period: Optional[str] = None,
       session_id: Optional[str] = None,
       sources_out: Optional[list] = None,
+      chart_out: Optional[list] = None,
   ):
       """
       Streaming version of generate_answer.
-      Yields LLM tokens live. If sources_out is provided, it is populated
-      with the retrieved source chunks so the caller can display citations.
+      Yields clean LLM text tokens live, suppressing any ```chart_data JSON block
+      from the user-visible stream while parsing and returning it via chart_out.
       """
       import re
       active_ticker = ticker
@@ -442,20 +592,65 @@ ANALYST RESPONSE:"""
           "### 💡 What Does This Mean for an Investor?\n"
           "• 🟢 **Positive Signals**: 1-2 concise bullet points highlighting financial strengths, margin expansion, or capital returns shown in the data.\n"
           "• 🟡 **Things to Monitor**: 1-2 concise bullet points highlighting key operational risks, cost pressures, or trends to watch.\n"
-          "• 📌 **Key Takeaway**: One sentence summarizing the overall implication for shareholders."
+          "• 📌 **Key Takeaway**: One sentence summarizing the overall implication for shareholders.\n\n"
+          f"{CHART_INSTRUCTION}"
       )
       user_prompt = (
           f"{xbrl_section}CONTEXT FROM FINANCIAL REPORT:\n{context}\n\n"
           f"RETAIL INVESTOR QUESTION:\n{query}\n\nANALYST RESPONSE:"
       )
 
-      yield from self._call_llm_stream(
+      raw_tokens: List[str] = []
+      in_chart = False
+      buffer = ""
+
+      for delta in self._call_llm_stream(
           messages=[
               {"role": "system", "content": system_prompt},
               {"role": "user",   "content": user_prompt},
           ],
           temperature=0.1,
-      )
+      ):
+          raw_tokens.append(delta)
+          if in_chart:
+              # Resume normal streaming if chart block has closed with ```
+              chart_tail = "".join(raw_tokens).split("```chart_data", 1)[-1]
+              if "```" in chart_tail:
+                  in_chart = False
+                  buffer = ""
+              continue
+
+          buffer += delta
+          if "```chart_data" in buffer:
+              parts = buffer.split("```chart_data", 1)
+              pre_text = parts[0]
+              if pre_text:
+                  yield pre_text
+              in_chart = True
+              buffer = ""
+          elif "```" in buffer:
+              idx = buffer.find("```")
+              after = buffer[idx:]
+              if "```chart_data".startswith(after):
+                  continue
+              else:
+                  yield buffer
+                  buffer = ""
+          else:
+              yield buffer
+              buffer = ""
+
+      if buffer and not in_chart:
+          yield buffer
+
+      # Extract chart and enrich with XBRL
+      full_raw = "".join(raw_tokens)
+      chart_data = extract_chart(full_raw)
+      if chart_data and self.xbrl_retriever and active_ticker:
+          chart_data = enrich_chart_with_xbrl(chart_data, self.xbrl_retriever, active_ticker)
+
+      if chart_out is not None and chart_data:
+          chart_out.append(chart_data)
 
   def generate_standard_report(
       self, paper_id=None,
@@ -519,7 +714,8 @@ ANALYST RESPONSE:"""
         "### 4. Key Risk Factors & Market Headwinds\n"
         "### 5. Retail Investor Takeaway\n\n"
         "If STRUCTURED FINANCIAL DATA is provided at the top, use those exact figures in sections 2 and 3 — they are verified XBRL values from official filings.\n"
-        "Base all other statements strictly on the provided CONTEXT and cite pages/sections as [Page X]."
+        "Base all other statements strictly on the provided CONTEXT and cite pages/sections as [Page X].\n\n"
+        f"{CHART_INSTRUCTION}"
     )
 
     user_prompt = f"""{xbrl_section}CONTEXT FROM FINANCIAL FILING:
@@ -537,16 +733,22 @@ Generate the Standard Financial Analysis Report now."""
       )
     total_ms = (time.perf_counter() - total_start) * 1000
 
+    chart_data = extract_chart(answer)
+    if chart_data and self.xbrl_retriever and active_ticker:
+        chart_data = enrich_chart_with_xbrl(chart_data, self.xbrl_retriever, active_ticker)
+
+    clean_answer = get_display_text(answer) if chart_data else answer
+
     log_query(
         query=report_query, query_type="standard_report", paper_id=paper_id, top_k=6,
         num_chunks_retrieved=len(chunks), similarity_scores=similarity_scores,
         retrieval_latency_ms=retrieval_timer.elapsed_ms,
         llm_latency_ms=llm_timer.elapsed_ms,
         total_latency_ms=total_ms,
-        model_name=self.model_name, answer_length=len(answer),
+        model_name=self.model_name, answer_length=len(clean_answer),
     )
 
-    return {"answer": answer, "sources": chunks}
+    return {"answer": clean_answer, "sources": chunks, "chart_data": chart_data}
 
   def generate_standard_report_stream(
       self,
@@ -555,10 +757,12 @@ Generate the Standard Financial Analysis Report now."""
       fiscal_period: Optional[str] = None,
       session_id: Optional[str] = None,
       sources_out: Optional[list] = None,
+      chart_out: Optional[list] = None,
   ):
       """
       Streaming version of generate_standard_report.
-      Yields LLM tokens live. Populates sources_out if provided.
+      Yields clean LLM text tokens live, suppressing any ```chart_data JSON block
+      from the user-visible stream while parsing and returning it via chart_out.
       """
       active_ticker = ticker
       active_period = fiscal_period
@@ -603,20 +807,65 @@ Generate the Standard Financial Analysis Report now."""
           "### 5. Retail Investor Takeaway\n\n"
           "If STRUCTURED FINANCIAL DATA is provided at the top, use those exact figures in "
           "sections 2 and 3 — they are verified XBRL values from official filings.\n"
-          "Base all other statements strictly on the provided CONTEXT and cite pages/sections as [Page X]."
+          "Base all other statements strictly on the provided CONTEXT and cite pages/sections as [Page X].\n\n"
+          f"{CHART_INSTRUCTION}"
       )
       user_prompt = (
           f"{xbrl_section}CONTEXT FROM FINANCIAL FILING:\n{context}\n\n"
           "Generate the Standard Financial Analysis Report now."
       )
 
-      yield from self._call_llm_stream(
+      raw_tokens: List[str] = []
+      in_chart = False
+      buffer = ""
+
+      for delta in self._call_llm_stream(
           messages=[
               {"role": "system", "content": system_prompt},
               {"role": "user",   "content": user_prompt},
           ],
           temperature=0.2,
-      )
+      ):
+          raw_tokens.append(delta)
+          if in_chart:
+              # Resume normal streaming if chart block has closed with ```
+              chart_tail = "".join(raw_tokens).split("```chart_data", 1)[-1]
+              if "```" in chart_tail:
+                  in_chart = False
+                  buffer = ""
+              continue
+
+          buffer += delta
+          if "```chart_data" in buffer:
+              parts = buffer.split("```chart_data", 1)
+              pre_text = parts[0]
+              if pre_text:
+                  yield pre_text
+              in_chart = True
+              buffer = ""
+          elif "```" in buffer:
+              idx = buffer.find("```")
+              after = buffer[idx:]
+              if "```chart_data".startswith(after):
+                  continue
+              else:
+                  yield buffer
+                  buffer = ""
+          else:
+              yield buffer
+              buffer = ""
+
+      if buffer and not in_chart:
+          yield buffer
+
+      # Extract chart and enrich with XBRL
+      full_raw = "".join(raw_tokens)
+      chart_data = extract_chart(full_raw)
+      if chart_data and self.xbrl_retriever and active_ticker:
+          chart_data = enrich_chart_with_xbrl(chart_data, self.xbrl_retriever, active_ticker)
+
+      if chart_out is not None and chart_data:
+          chart_out.append(chart_data)
 
 
 if __name__ == "__main__":

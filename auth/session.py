@@ -2,21 +2,42 @@
 """
 Session helpers for FinSight.
 
-PKCE strategy for Streamlit (stateless):
-  1. Generate code_verifier + code_challenge ourselves before redirecting.
-  2. Encode the code_verifier directly into the redirect_to URL as ?cv=...
-     so it survives the external Google redirect.
-  3. On callback, read ?code and ?cv from query params, inject cv into
-     the gotrue client, then call exchange_code_for_session.
+PKCE strategy for Streamlit — how the verifier survives the redirect:
+
+  PRIMARY: ?cv=verifier encoded in redirect_to URL
+  ─────────────────────────────────────────────────
+  Supabase DOES pass through query params appended to redirect_to.
+  e.g. redirect_to = "http://localhost:8501?cv=abc123"
+  After OAuth, Supabase redirects to:  http://localhost:8501?code=XYZ&cv=abc123
+  Works as long as the redirect URL pattern is whitelisted in Supabase Dashboard.
+
+  REQUIREMENT: Add these to Supabase Dashboard → Auth → Redirect URLs:
+    http://localhost:8501/**
+    https://your-app.streamlit.app/**
+
+  FALLBACKS (in order):
+    1. Supabase pkce_sessions table  — survives container restarts
+    2. /tmp file                     — same-container fallback
+    3. st.session_state              — same-tab fallback
 """
 import os
+import sys
+import json
+import time
 import secrets
 import hashlib
 import base64
+import tempfile
 from urllib.parse import urlencode
 
 import streamlit as st
 from auth.supabase_client import get_supabase
+
+# ─────────────────────────────────────────────
+# SET TO True TO SEE FULL PKCE DEBUG PANEL
+# (disable before committing to production)
+DEBUG_AUTH = False
+# ─────────────────────────────────────────────
 
 
 # ─────────────────────────────────────────────
@@ -61,6 +82,111 @@ def _clear_session_cookie():
         width=0,
     )
 
+# ─────────────────────────────────────────────
+# PKCE VERIFIER STORE  (DB primary, /tmp fallback)
+#
+# WHY NOT temp file alone:
+#   - Streamlit Cloud sleeps idle apps → container wiped → /tmp gone
+#   - Multi-instance deployments: login hits container A, callback hits B
+#
+# WHY "most recent" pattern works:
+#   Only one OAuth flow can be in progress at a time per user session.
+#   We store the latest verifier and always read the freshest one.
+# ─────────────────────────────────────────────
+_PKCE_FILE = os.path.join(tempfile.gettempdir(), "finsight_pkce_verifier.json")
+_PKCE_TTL  = 600  # 10 minutes
+
+
+def _save_verifier(verifier: str) -> None:
+    """
+    Persist the PKCE verifier to:
+      1. Supabase pkce_sessions table  (survives container restarts)
+      2. /tmp file                      (instant local fallback)
+      3. st.session_state              (works if tab never navigated away)
+    """
+    # — Layer 1: Supabase DB ———————————————————————————
+    try:
+        get_supabase().table("pkce_sessions").insert(
+            {"verifier": verifier}
+        ).execute()
+        # Clean up expired rows while we're here
+        get_supabase().table("pkce_sessions").delete().lt(
+            "created_at",
+            f"now() - interval '{_PKCE_TTL} seconds'"
+        ).execute()
+        print("[PKCE] verifier saved → Supabase DB", file=sys.stderr)
+    except Exception as e:
+        print(f"[PKCE] DB save failed (will use /tmp): {e}", file=sys.stderr)
+
+    # — Layer 2: /tmp file ———————————————————————————
+    try:
+        with open(_PKCE_FILE, "w") as f:
+            json.dump({"verifier": verifier, "ts": time.time()}, f)
+        print(f"[PKCE] verifier saved → {_PKCE_FILE}", file=sys.stderr)
+    except Exception as e:
+        print(f"[PKCE] /tmp save failed: {e}", file=sys.stderr)
+
+    # — Layer 3: session_state (best-effort) —————————————————
+    st.session_state["pkce_verifier"] = verifier
+
+
+def _load_verifier() -> str:
+    """
+    Recover the PKCE verifier from the first available source:
+      1. Supabase pkce_sessions  (most recent row within TTL)
+      2. /tmp file               (same-container fallback)
+      3. st.session_state        (same-tab fallback)
+    Cleans up consumed records automatically.
+    """
+    # — Layer 1: Supabase DB ———————————————————————————
+    try:
+        res = (
+            get_supabase()
+            .table("pkce_sessions")
+            .select("id, verifier, created_at")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            row = res.data[0]
+            from datetime import datetime, timezone
+            created = datetime.fromisoformat(
+                row["created_at"].replace("Z", "+00:00")
+            )
+            age = (datetime.now(timezone.utc) - created).total_seconds()
+            if age < _PKCE_TTL:
+                # Delete consumed row
+                get_supabase().table("pkce_sessions").delete().eq(
+                    "id", row["id"]
+                ).execute()
+                print(f"[PKCE] verifier loaded from DB (age={age:.1f}s)", file=sys.stderr)
+                return row["verifier"]
+            print(f"[PKCE] DB row expired (age={age:.1f}s)", file=sys.stderr)
+    except Exception as e:
+        print(f"[PKCE] DB load failed: {e}", file=sys.stderr)
+
+    # — Layer 2: /tmp file ———————————————————————————
+    try:
+        with open(_PKCE_FILE) as f:
+            data = json.load(f)
+        os.unlink(_PKCE_FILE)
+        age = time.time() - data.get("ts", 0)
+        if age < _PKCE_TTL:
+            print(f"[PKCE] verifier loaded from /tmp (age={age:.1f}s)", file=sys.stderr)
+            return data["verifier"]
+        print(f"[PKCE] /tmp file expired (age={age:.1f}s)", file=sys.stderr)
+    except FileNotFoundError:
+        print("[PKCE] /tmp file not found", file=sys.stderr)
+    except Exception as e:
+        print(f"[PKCE] /tmp load error: {e}", file=sys.stderr)
+
+    # — Layer 3: session_state ——————————————————————————
+    cv = st.session_state.get("pkce_verifier", "")
+    if cv:
+        print("[PKCE] verifier loaded from session_state", file=sys.stderr)
+    return cv
+
 
 # ─────────────────────────────────────────────
 # CORE AUTH HELPERS
@@ -86,9 +212,28 @@ def require_auth() -> dict:
 
     params = st.query_params.to_dict()
 
-    # OAuth callback
+    # ── OAuth callback ──────────────────────────────────────────────────
     if "code" in params:
+        # Layer 1 (primary): ?cv= in the callback URL — Supabase passes it through
         code_verifier = params.get("cv", "")
+        if code_verifier:
+            print("[PKCE] verifier recovered from ?cv= URL param", file=sys.stderr)
+
+        # Layer 2: Supabase DB (survives container restarts)
+        if not code_verifier:
+            code_verifier = _load_verifier()
+
+        if DEBUG_AUTH:
+            with st.expander("PKCE Debug Info", expanded=True):
+                st.markdown("**All query params returned by Supabase:**")
+                st.json(params)
+                st.markdown(f"**`?cv=` in URL:** `{repr(params.get('cv', ''))}`")
+                st.markdown(f"**Final code_verifier:** `{repr(code_verifier[:20] + '...' if len(code_verifier) > 20 else code_verifier)}`  "
+                            f"(len={len(code_verifier)})")
+                st.markdown(f"**auth_code (first 20 chars):** `{params['code'][:20]}...`")
+            print(f"[DEBUG-PKCE] params keys={list(params.keys())}", file=sys.stderr)
+            print(f"[DEBUG-PKCE] cv={repr(code_verifier[:20])}...", file=sys.stderr)
+
         _handle_oauth_callback(params["code"], code_verifier)
         if is_authenticated():
             return get_current_user()
@@ -115,13 +260,25 @@ def require_auth() -> dict:
 
 
 def login_with_google():
-    """Initiates Google OAuth with PKCE, encoding the verifier in the redirect URL."""
+    """
+    Initiates Google OAuth with PKCE.
+
+    The code_verifier is encoded into the redirect_to URL as ?cv=...
+    Supabase passes all redirect_to query params through to the callback URL.
+
+    REQUIREMENT: Supabase Dashboard → Auth → Redirect URLs must include:
+      http://localhost:8501/**    (for local dev)
+      https://your-app.streamlit.app/**    (for production)
+    """
     verifier  = _pkce_verifier()
     challenge = _pkce_challenge(verifier)
 
     base_redirect = _get_redirect_url()
-    # Encode verifier in redirect URL so it survives the external redirect
+    # Primary: encode verifier in redirect URL — Supabase echoes it back
     redirect_with_cv = f"{base_redirect}?cv={verifier}"
+
+    # Also save to DB+file+session as fallback layers
+    _save_verifier(verifier)
 
     try:
         supabase_url = st.secrets["supabase"]["url"]
@@ -130,14 +287,20 @@ def login_with_google():
 
     params = {
         "provider": "google",
-        "redirect_to": redirect_with_cv,
+        "redirect_to": redirect_with_cv,   # ?cv= survives the full roundtrip
         "code_challenge": challenge,
         "code_challenge_method": "s256",
     }
     auth_url = f"{supabase_url}/auth/v1/authorize?{urlencode(params)}"
 
+    if DEBUG_AUTH:
+        print(f"[PKCE] redirect_to: {redirect_with_cv[:60]}...", file=sys.stderr)
+
     st.markdown(
-        f'<meta http-equiv="refresh" content="0; url={auth_url}">',
+        f"""
+        <script>window.top.location.href = "{auth_url}";</script>
+        <meta http-equiv="refresh" content="0; url={auth_url}">
+        """,
         unsafe_allow_html=True,
     )
     st.stop()
@@ -164,8 +327,9 @@ def _handle_oauth_callback(code: str, code_verifier: str):
     """Exchanges the OAuth code + PKCE verifier for a Supabase session."""
     if not code:
         return
-    import sys
-    print(f"[Auth] callback: code={code[:15]}..., cv_present={bool(code_verifier)}, cv_len={len(code_verifier)}", file=sys.stderr)
+    print(f"[Auth] exchange attempt: code={code[:15]}..., "
+          f"cv_present={bool(code_verifier)}, cv_len={len(code_verifier)}",
+          file=sys.stderr)
     try:
         supabase = get_supabase()
         exchange_params = {"auth_code": code}
@@ -177,9 +341,14 @@ def _handle_oauth_callback(code: str, code_verifier: str):
             if res.session and res.session.refresh_token:
                 _save_session_cookie(res.session.refresh_token)
             st.query_params.clear()
+            if DEBUG_AUTH:
+                print("[Auth] exchange SUCCESS", file=sys.stderr)
     except Exception as e:
-        st.error(f"Authentication failed: {e}")
-        print(f"[Auth] exchange error: {e}", file=sys.stderr)
+        err_str = str(e)
+        st.error(f"Authentication failed: {err_str}")
+        print(f"[Auth] exchange FAILED: {err_str}", file=sys.stderr)
+        if DEBUG_AUTH:
+            st.expander("Exchange Error Detail", expanded=True).code(err_str)
 
 
 def _store_user(user):
@@ -209,16 +378,30 @@ def _store_user(user):
 
 def _get_redirect_url() -> str:
     """Returns the base OAuth redirect URL (without query params)."""
+    # 1. Dynamically inspect request host header so localhost stays on localhost
     try:
-        override = st.secrets["app"]["oauth_redirect_url"]
-        if override:
-            return override
-    except (KeyError, FileNotFoundError):
+        host = st.context.headers.get("host", "")
+        if "localhost" in host or "127.0.0.1" in host:
+            return f"http://{host}"
+        if "streamlit.app" in host:
+            return f"https://{host}"
+    except Exception:
         pass
+
+    # 2. Check local environment override
     override = os.environ.get("OAUTH_REDIRECT_URL", "")
     if override:
         return override
-    return os.environ.get("STREAMLIT_SERVER_ADDRESS", "http://localhost:8501")
+
+    # 3. Check secrets override
+    try:
+        sec_override = st.secrets["app"]["oauth_redirect_url"]
+        if sec_override:
+            return sec_override
+    except (KeyError, FileNotFoundError):
+        pass
+
+    return "http://localhost:8501"
 
 
 # ─────────────────────────────────────────────
@@ -304,18 +487,18 @@ def _render_login_page():
 
     <div style="text-align: center;">
         <span class="login-badge">FINANCIAL RESEARCH PLATFORM</span>
-        <div class="login-logo">📊 FinSight</div>
+        <div class="login-logo">FinSight</div>
         <div class="login-sub">
             Institutional Financial Research Engine<br>
             <span style="font-size: 0.76rem; color: #64748b;">
                 Vectorized SEC EDGAR Retrieval &amp; Verified XBRL Grounding
             </span>
         </div>
-        <div class="login-divider">Sign in with your institutional or Google account</div>
+        <div class="login-divider">Sign in with your Google account</div>
     </div>
     """, unsafe_allow_html=True)
 
-    if st.button("🔐  Continue with Google",
+    if st.button("Continue with Google",
                  use_container_width=True,
                  key="btn_google_login",
                  type="primary"):
@@ -330,39 +513,7 @@ def _render_login_page():
 
 
 def render_sidebar_user(current_user: dict, page_key: str = "main"):
-    """Renders the standard FinSight user identity card & logout button in the sidebar."""
-    avatar = current_user.get("avatar_url", "")
-    avatar_html = (
-        f'<img src="{avatar}" style="width:28px;height:28px;border-radius:50%;vertical-align:middle;margin-right:8px;">'
-        if avatar else
-        '<span style="font-size:1.1rem;margin-right:6px;">👤</span>'
-    )
-    user_name = current_user.get("name", "User")
-    user_email = current_user.get("email", "")
-    st.sidebar.markdown(f"""
-    <div style="padding: 0.4rem 0 0.8rem 0;">
-        <div style="font-size: 1.15rem; font-weight: 700; color: #f8fafc; letter-spacing: -0.01em;">
-            FINSIGHT
-        </div>
-        <div style="font-size: 0.76rem; color: #64748b; margin-top: 1px;">
-            Institutional Financial Research Engine
-        </div>
-        <div style="
-            margin-top: 0.85rem;
-            padding: 0.55rem 0.75rem;
-            background: #0f1624;
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 6px;
-            display: flex;
-            align-items: center;
-        ">
-            {avatar_html}
-            <div>
-                <div style="font-size:0.8rem;font-weight:600;color:#e2e8f0;line-height:1.2;">{user_name}</div>
-                <div style="font-size:0.7rem;color:#64748b;">{user_email}</div>
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    if st.sidebar.button("Sign Out", key=f"btn_logout_{page_key}", use_container_width=True):
-        logout()
+    """Renders the standard FinSight user identity card in the sidebar."""
+    from ui.components import render_user_profile
+    render_user_profile(current_user)
+

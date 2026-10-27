@@ -24,6 +24,7 @@ lxml>=5.0.0                  # Fast XML/HTML parser
 # ── Embeddings & Vector Store ─────────────────────────────────
 sentence-transformers>=3.0.0 # BAAI/bge-small-en-v1.5 embeddings
 chromadb>=0.5.0              # Local vector database (local dev only; pgvector used in production)
+flashrank>=0.2.10            # Ultra-lightweight local cross-encoder re-ranking (ONNX, <40MB RAM)
 
 # ── PostgreSQL / XBRL structured data ────────────────────────
 psycopg2-binary>=2.9.0       # PostgreSQL adapter

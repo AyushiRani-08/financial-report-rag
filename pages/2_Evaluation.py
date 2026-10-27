@@ -18,46 +18,40 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
-st.set_page_config(
-    page_title="FinSight — Evaluation Audit",
-    page_icon="🧪",
-    layout="wide",
-)
+from auth.session import require_auth, render_sidebar_user, logout
+from ui import apply_theme, render_settings_section
 
-# ── Design System ────────────────────────────────────────────────────────────
+# ── Clean Theme Styles (Light & Dark Support) ─────────────────────────────
+apply_theme()
+
+# ── Auth Gate ─────────────────────────────────────────────────────────────
+current_user = require_auth()
+render_sidebar_user(current_user, page_key="eval")
+
+with st.sidebar:
+    render_settings_section(on_logout=logout)
+
+
+# ── Evaluation Specific Component Styles ──────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
-* { font-family: 'Inter', sans-serif; }
-.stApp { background-color: #080d16 !important; color: #f1f5f9 !important; }
-header[data-testid="stHeader"] { background: transparent !important; }
-[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #0f172a 0%, #111827 100%) !important;
-    border-right: 1px solid rgba(255,255,255,0.07) !important;
-}
-[data-testid="stMetric"] {
-    background: rgba(15,23,42,0.8) !important;
-    border: 1px solid rgba(255,255,255,0.08) !important;
-    border-radius: 14px !important; padding: 1rem !important;
-    backdrop-filter: blur(8px);
-}
-[data-testid="stMetricValue"] { color: #60a5fa !important; font-weight: 700 !important; font-size: 1.5rem !important; }
-[data-testid="stMetricLabel"] { color: #94a3b8 !important; font-size: 0.78rem !important; }
-[data-testid="stMetricDelta"] { font-size: 0.78rem !important; }
-
 /* Page header */
 .page-header {
-    background: linear-gradient(135deg, rgba(96,165,250,0.12), rgba(129,140,248,0.12), rgba(167,139,250,0.12));
-    border: 1px solid rgba(96,165,250,0.2);
-    border-radius: 18px; padding: 1.5rem 2rem; margin-bottom: 1.5rem;
+    margin-bottom: 1.25rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid rgba(128, 128, 128, 0.2);
 }
 .page-title {
-    font-size: 2rem; font-weight: 800;
-    background: linear-gradient(135deg, #60a5fa, #818cf8, #a78bfa);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    background-clip: text; margin: 0;
+    font-size: 1.4rem;
+    font-weight: 700;
+    margin: 0;
 }
-.page-sub { font-size: 0.88rem; color: #64748b; margin-top: 0.25rem; }
+.page-sub {
+    font-size: 0.85rem;
+    color: #64748b;
+    margin-top: 0.25rem;
+}
+
 
 /* Dimension score cards */
 .dim-card {
@@ -141,7 +135,7 @@ def pct(lst):
 # ── Page header ─────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="page-header">
-    <div class="page-title">🧪 RAG Evaluation Dashboard</div>
+    <div class="page-title">RAG Evaluation Dashboard</div>
     <div class="page-sub">
         50-question test suite &nbsp;·&nbsp;
         5 accuracy dimensions: Retrieval · Numerical · Calculation · Groundedness · Abstention
@@ -166,9 +160,9 @@ if not result_files:
 col_sel, col_meta = st.columns([2, 3])
 with col_sel:
     selected_file = st.selectbox(
-        "📂 Select Evaluation Run",
+        "Select Evaluation Run",
         result_files,
-        format_func=lambda p: f"{'⭐ (50-Q Suite) ' if p.name.startswith('eval50_') else '📄 (Legacy) '}{p.name}  ({max(1, p.stat().st_size // 1024)} KB)",
+        format_func=lambda p: f"{'(50-Q Suite) ' if p.name.startswith('eval50_') else '(Legacy) '}{p.name}  ({max(1, p.stat().st_size // 1024)} KB)",
     )
 
 with open(selected_file, "r", encoding="utf-8") as f:
@@ -177,15 +171,15 @@ with open(selected_file, "r", encoding="utf-8") as f:
 results    = eval_data.get("results", [])
 summary    = eval_data.get("summary", {})
 if not selected_file.name.startswith("eval50_"):
-    st.info("💡 You are viewing a legacy evaluation file. Run `python eval/run_eval_50.py` to produce a full 5-dimension report on the 50 Golden Questions.")
+    st.info("You are viewing a legacy evaluation file. Run python eval/run_eval_50.py to produce a full 5-dimension report on the 50 Golden Questions.")
 timestamp  = eval_data.get("run_timestamp", "Unknown")
 model_name = eval_data.get("model", "Unknown")
 
 with col_meta:
     st.caption(
-        f"🕐 **Run:** `{timestamp}`  &nbsp;|&nbsp;  "
-        f"🤖 **Model:** `{model_name}`  &nbsp;|&nbsp;  "
-        f"📝 **Cases:** `{len(results)}`"
+        f"**Run:** `{timestamp}`  &nbsp;|&nbsp;  "
+        f"**Model:** `{model_name}`  &nbsp;|&nbsp;  "
+        f"**Cases:** `{len(results)}`"
     )
 
 st.divider()
@@ -193,7 +187,7 @@ st.divider()
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 1 — OVERALL KPI CARDS
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown("### 📊 Overall Performance")
+st.markdown("### Overall Performance")
 
 overall_pass_rate = pct([r.get("overall_pass") for r in results])
 halluc_count      = sum(1 for r in results if r.get("has_hallucination") is True)
@@ -224,7 +218,7 @@ st.divider()
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 2 — 5 DIMENSION ACCURACY CARDS
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown("### 🎯 Accuracy by Dimension")
+st.markdown("### Accuracy by Dimension")
 dim_cols = st.columns(5)
 for col, (dim_key, dim_label, color) in zip(dim_cols, DIMENSIONS):
     applicable = [r.get(dim_key) for r in results if r.get(dim_key) is not None]
@@ -250,7 +244,7 @@ st.divider()
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 3 — RADAR / SPIDER CHART (5 dimensions)
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown("### 🕸️ Accuracy Radar")
+st.markdown("### Accuracy Radar")
 
 categories_radar = [dl for _, dl, _ in DIMENSIONS]
 values_radar = []
@@ -290,7 +284,7 @@ st.divider()
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 4 — HEATMAP: Category × Dimension
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown("### 🗺️ Accuracy Heatmap — Category × Dimension")
+st.markdown("### Accuracy Heatmap — Category × Dimension")
 
 cats_in_data = list(dict.fromkeys(r.get("category", r.get("mode", "general")) for r in results))
 heatmap_rows = []
@@ -331,7 +325,7 @@ st.divider()
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 5 — CATEGORY PASS-RATE BAR CHART
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown("### 📋 Pass Rate by Question Category")
+st.markdown("### Pass Rate by Question Category")
 
 bar_data = []
 for cat in cats_in_data:
@@ -368,7 +362,7 @@ st.divider()
 col_abst, col_halluc = st.columns(2)
 
 with col_abst:
-    st.markdown("#### 🚫 Abstention Analysis")
+    st.markdown("#### Abstention Analysis")
     abst_needed  = [r for r in results if r.get("abstention_expected")]
     abst_answer  = [r for r in results if not r.get("abstention_expected")]
     abst_correct = sum(1 for r in abst_needed if r.get("abstention_accuracy") is True)
@@ -394,7 +388,7 @@ with col_abst:
     st.plotly_chart(fig_abst, use_container_width=True)
 
 with col_halluc:
-    st.markdown("#### 🔍 Groundedness Scores Distribution")
+    st.markdown("#### Groundedness Scores Distribution")
     gs_vals = [r.get("groundedness_score") for r in results if r.get("groundedness_score") is not None]
     if gs_vals:
         gs_counts = {i: gs_vals.count(i) for i in range(1, 6)}
@@ -422,7 +416,7 @@ st.divider()
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 7 — FILTERS + DETAILED CASE AUDIT TABLE
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown("### 🔍 Detailed Case Audit")
+st.markdown("### Detailed Case Audit")
 
 filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
 with filter_col1:
@@ -473,7 +467,7 @@ for r in filtered:
             badge_class = "pill-pass" if v else "pill-fail"
             dim_badges += f'<span class="pill {badge_class}">{dim_label[:3].upper()}</span> '
 
-    status_icon = "✅" if passed else "❌"
+    status_icon = "[PASS]" if passed else "[FAIL]"
     expander_title = (
         f"{status_icon} [{q_id}] {cat_label} — {sub_cat.replace('_', ' ').title()}"
     )
@@ -557,7 +551,7 @@ st.divider()
 # ─────────────────────────────────────────────────────────────────────────────
 num_results = [r for r in results if r.get("relative_error_pct") is not None]
 if num_results:
-    st.markdown("### 📉 Numerical Error Distribution")
+    st.markdown("### Numerical Error Distribution")
     scatter_data = [
         {
             "ID": r.get("id", str(i)),
@@ -590,7 +584,7 @@ if num_results:
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 9 — RAW DATA TABLE (downloadable)
 # ─────────────────────────────────────────────────────────────────────────────
-with st.expander("📄 Full Results Table (all columns)", expanded=False):
+with st.expander("Full Results Table (all columns)", expanded=False):
     df_full = pd.DataFrame(results)
     cols_show = [
         "id", "category", "question", "overall_pass",
@@ -604,7 +598,7 @@ with st.expander("📄 Full Results Table (all columns)", expanded=False):
     cols_show = [c for c in cols_show if c in df_full.columns]
     st.dataframe(df_full[cols_show], use_container_width=True)
     csv = df_full[cols_show].to_csv(index=False)
-    st.download_button("⬇️ Download CSV", csv, "eval_results.csv", "text/csv")
+    st.download_button("Download CSV", csv, "eval_results.csv", "text/csv")
 
 st.caption(
     "FinSight Evaluation Dashboard · 50 Questions · 5 Accuracy Dimensions · "
