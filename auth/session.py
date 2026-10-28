@@ -28,6 +28,7 @@ import secrets
 import hashlib
 import base64
 import tempfile
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 
 import streamlit as st
@@ -109,14 +110,18 @@ def _save_verifier(verifier: str) -> None:
         get_supabase_admin().table("pkce_sessions").insert(
             {"verifier": verifier}
         ).execute()
-        # Clean up expired rows while we're here
-        get_supabase_admin().table("pkce_sessions").delete().lt(
-            "created_at",
-            f"now() - interval '{_PKCE_TTL} seconds'"
-        ).execute()
         print("[PKCE] verifier saved → Supabase DB", file=sys.stderr)
     except Exception as e:
         print(f"[PKCE] DB save failed (will use /tmp): {e}", file=sys.stderr)
+
+    # Clean up expired rows in a separate isolated block so cleanup issues never trigger fallback
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=_PKCE_TTL)).isoformat()
+        get_supabase_admin().table("pkce_sessions").delete().lt(
+            "created_at", cutoff
+        ).execute()
+    except Exception:
+        pass
 
     # — Layer 2: /tmp file ———————————————————————————
     try:
