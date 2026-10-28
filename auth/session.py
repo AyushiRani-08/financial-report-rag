@@ -31,7 +31,7 @@ import tempfile
 from urllib.parse import urlencode
 
 import streamlit as st
-from auth.supabase_client import get_supabase
+from auth.supabase_client import get_supabase, get_supabase_admin
 
 # ─────────────────────────────────────────────
 # SET TO True TO SEE FULL PKCE DEBUG PANEL
@@ -104,13 +104,13 @@ def _save_verifier(verifier: str) -> None:
       2. /tmp file                      (instant local fallback)
       3. st.session_state              (works if tab never navigated away)
     """
-    # — Layer 1: Supabase DB ———————————————————————————
+    # — Layer 1: Supabase DB (using admin service_role client to bypass RLS) —————
     try:
-        get_supabase().table("pkce_sessions").insert(
+        get_supabase_admin().table("pkce_sessions").insert(
             {"verifier": verifier}
         ).execute()
         # Clean up expired rows while we're here
-        get_supabase().table("pkce_sessions").delete().lt(
+        get_supabase_admin().table("pkce_sessions").delete().lt(
             "created_at",
             f"now() - interval '{_PKCE_TTL} seconds'"
         ).execute()
@@ -138,10 +138,10 @@ def _load_verifier() -> str:
       3. st.session_state        (same-tab fallback)
     Cleans up consumed records automatically.
     """
-    # — Layer 1: Supabase DB ———————————————————————————
+    # — Layer 1: Supabase DB (using admin service_role client to bypass RLS) —————
     try:
         res = (
-            get_supabase()
+            get_supabase_admin()
             .table("pkce_sessions")
             .select("id, verifier, created_at")
             .order("created_at", desc=True)
@@ -157,7 +157,7 @@ def _load_verifier() -> str:
             age = (datetime.now(timezone.utc) - created).total_seconds()
             if age < _PKCE_TTL:
                 # Delete consumed row
-                get_supabase().table("pkce_sessions").delete().eq(
+                get_supabase_admin().table("pkce_sessions").delete().eq(
                     "id", row["id"]
                 ).execute()
                 print(f"[PKCE] verifier loaded from DB (age={age:.1f}s)", file=sys.stderr)
@@ -507,15 +507,44 @@ def _render_login_page():
     </div>
     """, unsafe_allow_html=True)
 
-    # Use a Streamlit button so the PKCE verifier is generated exactly once,
-    # at click-time — not on every page render (which would create stale verifiers).
-    if st.button(
-        "Continue with Google",
-        use_container_width=True,
-        key="btn_google_login",
-        type="primary",
-    ):
-        login_with_google()
+    # Cache the auth URL in session_state so it is generated exactly once per session,
+    # ensuring the PKCE verifier stored in the DB matches what is sent in the URL.
+    # Using a native <a target="_top"> link escapes Streamlit Cloud's iframe wrapper,
+    # preventing Google's anti-clickjacking 403 error.
+    if "cached_auth_url" not in st.session_state:
+        st.session_state["cached_auth_url"] = _build_auth_url()
+    auth_url = st.session_state["cached_auth_url"]
+
+    st.markdown(f"""
+    <a href="{auth_url}" target="_top" style="text-decoration: none;">
+        <div style="
+            width: 100%;
+            background-color: #2563eb;
+            color: #ffffff;
+            font-weight: 600;
+            padding: 0.65rem 1rem;
+            border-radius: 0.5rem;
+            text-align: center;
+            font-size: 0.95rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.6rem;
+            cursor: pointer;
+            box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+            transition: background-color 0.15s ease;
+            box-sizing: border-box;
+        " onmouseover="this.style.backgroundColor='#1d4ed8'" onmouseout="this.style.backgroundColor='#2563eb'">
+            <svg width="18" height="18" viewBox="0 0 24 24">
+                <path fill="#ffffff" d="M21.35 11.1h-9.17v2.98h5.27c-.23 1.25-.94 2.3-2 3.01v2.5h3.24c1.89-1.74 2.98-4.3 2.98-7.39 0-.7-.06-1.37-.18-2.1z"/>
+                <path fill="#ffffff" d="M12.18 21c2.7 0 4.96-.89 6.62-2.42l-3.24-2.5c-.9.6-2.05.96-3.38.96-2.6 0-4.8-1.76-5.59-4.12H3.25v2.58A9.99 9.99 0 0 0 12.18 21z"/>
+                <path fill="#ffffff" d="M6.59 12.92c-.2-.6-.31-1.24-.31-1.92s.11-1.32.31-1.92V6.5H3.25A9.99 9.99 0 0 0 2.18 11c0 1.61.39 3.14 1.07 4.5l3.34-2.58z"/>
+                <path fill="#ffffff" d="M12.18 4.96c1.47 0 2.79.51 3.83 1.5l2.87-2.87C17.13 1.95 14.87 1 12.18 1 7.63 1 3.73 3.58 2.18 7.5l3.34 2.58c.79-2.36 2.99-4.12 5.59-4.12z"/>
+            </svg>
+            Continue with Google
+        </div>
+    </a>
+    """, unsafe_allow_html=True)
 
     st.markdown("""
     <div class="login-footer">
