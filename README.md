@@ -41,7 +41,8 @@ The system is continuously benchmarked using dynamic evaluation against audited 
 
 ## 🏗️ Architecture & Engineering Log
 
-Detailed documentation on the two-track architecture, data flow, embedding experiments (`bge-small` vs `bge-base`), and how accuracy increased is documented in [ARCHITECTURE.md](ARCHITECTURE.md).
+- **System Architecture & Design Decisions**: Documented in [ARCHITECTURE.md](ARCHITECTURE.md).
+- **Engineering Roadmap & Future Goals**: Prioritized milestones (P0, P1, P2) documented in [ROADMAP.md](ROADMAP.md).
 
 ---
 
