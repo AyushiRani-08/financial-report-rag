@@ -1,6 +1,6 @@
--- Run this once in Supabase Dashboard → SQL Editor
--- Creates a tiny table to store PKCE verifiers server-side.
--- Survives container restarts, sleep cycles, and multi-instance deployments.
+-- Run this ONCE in Supabase Dashboard → SQL Editor
+-- Creates the pkce_sessions table so PKCE verifiers survive container restarts.
+-- Without this, the app falls back to /tmp which breaks on container sleep/restart.
 
 CREATE TABLE IF NOT EXISTS pkce_sessions (
     id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
@@ -13,3 +13,7 @@ CREATE INDEX IF NOT EXISTS pkce_sessions_ts_idx ON pkce_sessions (created_at);
 
 -- Disable RLS — only holds short-lived random tokens, no PII
 ALTER TABLE pkce_sessions DISABLE ROW LEVEL SECURITY;
+
+-- Grant access to the anon and service_role
+GRANT SELECT, INSERT, DELETE ON pkce_sessions TO anon;
+GRANT SELECT, INSERT, DELETE ON pkce_sessions TO service_role;

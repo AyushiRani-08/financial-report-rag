@@ -259,15 +259,19 @@ def require_auth() -> dict:
     return get_current_user()
 
 
-def get_google_auth_url() -> str:
+def _build_auth_url() -> str:
     """
-    Generates a fresh PKCE verifier, saves it to fallback layers,
-    and returns the Supabase OAuth authorization URL.
+    Generates a fresh PKCE verifier, caches it in session_state for this
+    render cycle, saves it to /tmp+DB fallback layers, and returns the
+    full Supabase OAuth authorization URL.
+
+    IMPORTANT: Called only ONCE per button-click, not on every render.
     """
     verifier  = _pkce_verifier()
     challenge = _pkce_challenge(verifier)
 
     base_redirect = _get_redirect_url()
+    # ?cv= is echoed back by Supabase in the callback URL — primary verifier transport
     redirect_with_cv = f"{base_redirect}?cv={verifier}"
 
     _save_verifier(verifier)
@@ -283,16 +287,24 @@ def get_google_auth_url() -> str:
         "code_challenge": challenge,
         "code_challenge_method": "s256",
     }
-    return f"{supabase_url}/auth/v1/authorize?{urlencode(params)}"
+    url = f"{supabase_url}/auth/v1/authorize?{urlencode(params)}"
+    print(f"[Auth] built auth_url redirect_to={redirect_with_cv[:80]}", file=sys.stderr)
+    return url
+
+
+# Keep old name as alias so any other callers don't break
+def get_google_auth_url() -> str:
+    return _build_auth_url()
 
 
 def login_with_google():
     """
-    Initiates Google OAuth with PKCE.
-    Uses target=_top link navigation to prevent Google from blocking
-    OAuth inside Streamlit Cloud iframes.
+    Initiates Google OAuth with PKCE via full-page top-level navigation.
+    Using window.top.location ensures we escape the Streamlit iframe so
+    Google's X-Frame-Options: DENY policy cannot block the sign-in page.
     """
-    auth_url = get_google_auth_url()
+    auth_url = _build_auth_url()
+    # window.top breaks out of any iframe; meta-refresh is the fallback
     st.markdown(
         f"""
         <script>window.top.location.href = "{auth_url}";</script>
@@ -495,38 +507,15 @@ def _render_login_page():
     </div>
     """, unsafe_allow_html=True)
 
-    auth_url = get_google_auth_url()
-
-    st.markdown(f"""
-    <a href="{auth_url}" target="_top" style="text-decoration: none;">
-        <div style="
-            width: 100%;
-            background-color: #2563eb;
-            color: #ffffff;
-            font-weight: 600;
-            padding: 0.65rem 1rem;
-            border-radius: 0.5rem;
-            text-align: center;
-            font-size: 0.95rem;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 0.6rem;
-            cursor: pointer;
-            box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
-            transition: background-color 0.15s ease;
-            box-sizing: border-box;
-        " onmouseover="this.style.backgroundColor='#1d4ed8'" onmouseout="this.style.backgroundColor='#2563eb'">
-            <svg width="18" height="18" viewBox="0 0 24 24">
-                <path fill="#ffffff" d="M21.35 11.1h-9.17v2.98h5.27c-.23 1.25-.94 2.3-2 3.01v2.5h3.24c1.89-1.74 2.98-4.3 2.98-7.39 0-.7-.06-1.37-.18-2.1z"/>
-                <path fill="#ffffff" d="M12.18 21c2.7 0 4.96-.89 6.62-2.42l-3.24-2.5c-.9.6-2.05.96-3.38.96-2.6 0-4.8-1.76-5.59-4.12H3.25v2.58A9.99 9.99 0 0 0 12.18 21z"/>
-                <path fill="#ffffff" d="M6.59 12.92c-.2-.6-.31-1.24-.31-1.92s.11-1.32.31-1.92V6.5H3.25A9.99 9.99 0 0 0 2.18 11c0 1.61.39 3.14 1.07 4.5l3.34-2.58z"/>
-                <path fill="#ffffff" d="M12.18 4.96c1.47 0 2.79.51 3.83 1.5l2.87-2.87C17.13 1.95 14.87 1 12.18 1 7.63 1 3.73 3.58 2.18 7.5l3.34 2.58c.79-2.36 2.99-4.12 5.59-4.12z"/>
-            </svg>
-            Continue with Google
-        </div>
-    </a>
-    """, unsafe_allow_html=True)
+    # Use a Streamlit button so the PKCE verifier is generated exactly once,
+    # at click-time — not on every page render (which would create stale verifiers).
+    if st.button(
+        "Continue with Google",
+        use_container_width=True,
+        key="btn_google_login",
+        type="primary",
+    ):
+        login_with_google()
 
     st.markdown("""
     <div class="login-footer">
