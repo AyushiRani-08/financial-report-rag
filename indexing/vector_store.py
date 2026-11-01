@@ -18,6 +18,11 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from indexing.embedder import Embedder
 from ingestion.pdf_parser import chunk_pdf
 from ingestion.html_parser import chunk_html
+from ingestion.table_extractor import (
+    chunk_document_blocks,
+    content_hash,
+    table_block_from_grid,
+)
 from utils.metadata_parser import parse_filing_metadata
 
 # Privacy redaction (graceful no-op if unavailable)
@@ -45,6 +50,37 @@ def _is_valid_uuid(val: str) -> bool:
         r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
         str(val or "").lower()
     ))
+
+
+# Metadata every chunk carries into the vector store. Kept flat so both backends
+# (pgvector columns and Chroma metadata) can store the same shape.
+_CHUNK_DEFAULTS = {
+    "page_number": None,
+    "is_table": False,
+    "table_caption": "",
+    "unit_context": "",
+    "section": "",
+    "statement_scope": "unspecified",
+}
+
+
+def normalise_chunks(chunks: list[dict]) -> list[dict]:
+    """Fills chunk metadata defaults, drops duplicate text, and renumbers chunk ids."""
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for chunk in chunks:
+        for key, default in _CHUNK_DEFAULTS.items():
+            chunk.setdefault(key, default)
+        digest = chunk.get("content_hash") or content_hash(chunk["text"])
+        chunk["content_hash"] = digest
+        if digest in seen:
+            continue
+        seen.add(digest)
+        unique.append(chunk)
+
+    for index, chunk in enumerate(unique):
+        chunk["chunk_id"] = index
+    return unique
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -87,13 +123,21 @@ class _SupabaseBackend:
         sql = """
             INSERT INTO public.embeddings
                 (id, user_id, paper_id, ticker, fiscal_period, form_type,
-                 page_number, word_count, file_type, content, embedding)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector)
+                 page_number, word_count, file_type, is_table, unit_context,
+                 table_caption, section, statement_scope, content_hash,
+                 content, embedding)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector)
             ON CONFLICT (id) DO UPDATE SET
-                content       = EXCLUDED.content,
-                embedding     = EXCLUDED.embedding,
-                page_number   = EXCLUDED.page_number,
-                word_count    = EXCLUDED.word_count
+                content         = EXCLUDED.content,
+                embedding       = EXCLUDED.embedding,
+                page_number     = EXCLUDED.page_number,
+                word_count      = EXCLUDED.word_count,
+                is_table        = EXCLUDED.is_table,
+                unit_context    = EXCLUDED.unit_context,
+                table_caption   = EXCLUDED.table_caption,
+                section         = EXCLUDED.section,
+                statement_scope = EXCLUDED.statement_scope,
+                content_hash    = EXCLUDED.content_hash
         """
         try:
             conn = self._get_conn()
@@ -110,6 +154,12 @@ class _SupabaseBackend:
                             c["page_number"],
                             c["word_count"],
                             ext.lstrip("."),
+                            bool(c["is_table"]),
+                            c["unit_context"],
+                            c["table_caption"],
+                            c["section"],
+                            c["statement_scope"],
+                            c["content_hash"],
                             c["text"],
                             str(c["embedding"].tolist()),
                         ))
@@ -178,9 +228,8 @@ class _SupabaseBackend:
     def query(self, query_vector: list[float], top_k: int, user_id: str,
               paper_id: Optional[str] = None, ticker: Optional[str] = None,
               fiscal_period: Optional[str] = None,
-              statement_scope: Optional[str] = None) -> list[dict]:
-        # statement_scope is accepted for API parity but not stored in this table.
-        # The pgvector embeddings table uses content-level metadata instead.
+              statement_scope: Optional[str] = None,
+              is_table: Optional[bool] = None) -> list[dict]:
         """Cosine similarity search with optional metadata filters."""
         if not _is_valid_uuid(user_id):
             print(f"[VectorStore] skipping query — invalid user_id: '{user_id}' (not authenticated)")
@@ -197,6 +246,12 @@ class _SupabaseBackend:
         if fiscal_period:
             conditions.append("fiscal_period = %s")
             params.append(fiscal_period)
+        if statement_scope:
+            conditions.append("statement_scope = %s")
+            params.append(statement_scope.lower())
+        if is_table is not None:
+            conditions.append("is_table = %s")
+            params.append(bool(is_table))
 
         where = " AND ".join(conditions)
         vec_str = str(query_vector)
@@ -211,6 +266,11 @@ class _SupabaseBackend:
                 page_number,
                 word_count,
                 file_type,
+                is_table,
+                unit_context,
+                table_caption,
+                section,
+                statement_scope,
                 content,
                 1 - (embedding <=> %s::vector) AS similarity
             FROM public.embeddings
@@ -239,13 +299,18 @@ class _SupabaseBackend:
                 "similarity_score": round(float(r["similarity"]), 4),
                 "distance": round(1.0 - float(r["similarity"]), 4),
                 "metadata": {
-                    "paper_id":      r["paper_id"],
-                    "ticker":        r["ticker"],
-                    "fiscal_period": r["fiscal_period"],
-                    "form_type":     r["form_type"],
-                    "page_number":   r["page_number"],
-                    "word_count":    r["word_count"],
-                    "file_type":     r["file_type"],
+                    "paper_id":        r["paper_id"],
+                    "ticker":          r["ticker"],
+                    "fiscal_period":   r["fiscal_period"],
+                    "form_type":       r["form_type"],
+                    "page_number":     r["page_number"],
+                    "word_count":      r["word_count"],
+                    "file_type":       r["file_type"],
+                    "is_table":        bool(r["is_table"]),
+                    "unit_context":    r["unit_context"] or "",
+                    "table_caption":   r["table_caption"] or "",
+                    "section":         r["section"] or "",
+                    "statement_scope": r["statement_scope"] or "unspecified",
                 },
             })
         return results
@@ -276,16 +341,21 @@ class _ChromaBackend:
         embeddings = [c["embedding"].tolist() for c in chunks]
         metadatas  = [
             {
-                "paper_id":      paper_id,
-                "ticker":        ticker,
-                "fiscal_period": fiscal_period,
-                "form_type":     form_type,
-                "statement_scope": "consolidated",
-                "is_consolidated": True,
-                "session_id":    user_id or "global",
-                "page_number":   c["page_number"],
-                "word_count":    c["word_count"],
-                "file_type":     ext.lstrip("."),
+                "paper_id":        paper_id,
+                "ticker":          ticker,
+                "fiscal_period":   fiscal_period,
+                "form_type":       form_type,
+                "statement_scope": c.get("statement_scope") or "unspecified",
+                "session_id":      user_id or "global",
+                # Chroma rejects None metadata values; 0 means "source has no pages".
+                "page_number":     c["page_number"] if c["page_number"] is not None else 0,
+                "word_count":      c["word_count"],
+                "file_type":       ext.lstrip("."),
+                "is_table":        bool(c.get("is_table")),
+                "unit_context":    c.get("unit_context") or "",
+                "table_caption":   c.get("table_caption") or "",
+                "section":         c.get("section") or "",
+                "content_hash":    c.get("content_hash") or "",
             }
             for c in chunks
         ]
@@ -312,7 +382,8 @@ class _ChromaBackend:
     def query(self, query_vector: list[float], top_k: int, user_id: str,
               paper_id: Optional[str] = None, ticker: Optional[str] = None,
               fiscal_period: Optional[str] = None,
-              statement_scope: Optional[str] = None) -> list[dict]:
+              statement_scope: Optional[str] = None,
+              is_table: Optional[bool] = None) -> list[dict]:
         conds = []
         if paper_id:
             conds.append({"paper_id": paper_id})
@@ -322,6 +393,8 @@ class _ChromaBackend:
             conds.append({"fiscal_period": fiscal_period})
         if statement_scope:
             conds.append({"statement_scope": statement_scope.lower()})
+        if is_table is not None:
+            conds.append({"is_table": bool(is_table)})
         where = ({"$and": conds} if len(conds) > 1
                  else conds[0] if conds else None)
 
@@ -404,14 +477,17 @@ class VectorStore:
         # 1. Parse & chunk
         print(f"1. Chunking {file_path} ({ext})...")
         if ext in (".html", ".htm"):
-            chunks = chunk_html(file_path, chunk_size=500, overlap_pct=0.10)
+            chunks = chunk_html(file_path, chunk_size=300, overlap_pct=0.10)
         elif ext == ".pdf":
-            chunks = chunk_pdf(file_path, chunk_size=500, overlap_pct=0.10)
-        elif ext in (".txt", ".md", ".csv", ".json", ".xml"):
+            chunks = chunk_pdf(file_path, chunk_size=300, overlap_pct=0.10)
+        elif ext == ".csv":
+            chunks = self._chunk_csv(file_path)
+        elif ext in (".txt", ".md", ".json", ".xml"):
             chunks = self._chunk_generic_text(file_path)
         else:
             raise ValueError(f"Unsupported format: '{ext}'")
 
+        chunks = normalise_chunks(chunks)
         if not chunks:
             return 0
 
@@ -471,6 +547,7 @@ class VectorStore:
         ticker: Optional[str] = None,
         fiscal_period: Optional[str] = None,
         statement_scope: Optional[str] = None,
+        is_table: Optional[bool] = None,
     ) -> list[dict]:
         return self._backend.query(
             query_vector=query_vector,
@@ -480,21 +557,34 @@ class VectorStore:
             ticker=ticker,
             fiscal_period=fiscal_period,
             statement_scope=statement_scope,
+            is_table=is_table,
         )
+
+    # ── CSV chunker (a CSV is a financial table) ─────────────────
+
+    def _chunk_csv(self, file_path: str, chunk_size: int = 300) -> list:
+        import csv
+
+        path_obj = Path(file_path)
+        with open(file_path, "r", encoding="utf-8", errors="ignore", newline="") as f:
+            rows = [row for row in csv.reader(f) if any(cell.strip() for cell in row)]
+        if len(rows) < 2:
+            return []
+
+        block = table_block_from_grid(rows, caption=path_obj.stem.replace("_", " "))
+        if block is None:
+            return []
+        return chunk_document_blocks([block], chunk_size=chunk_size)
 
     # ── Generic text chunker ─────────────────────────────────────
 
     def _chunk_generic_text(self, file_path: str,
-                             chunk_size: int = 500, overlap_pct: float = 0.10) -> list:
+                             chunk_size: int = 300, overlap_pct: float = 0.10) -> list:
         path_obj = Path(file_path)
         ext = path_obj.suffix.lower()
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
-        if ext == ".csv":
-            lines = content.splitlines()
-            if lines:
-                content = f"Financial Table (Columns: {lines[0]}):\n" + "\n".join(lines[1:])
-        elif ext in (".json", ".xml"):
+        if ext in (".json", ".xml"):
             try:
                 import json
                 content = json.dumps(json.loads(content), indent=2)
@@ -505,14 +595,14 @@ class VectorStore:
         if not words:
             return []
         step = max(1, int(chunk_size * (1.0 - overlap_pct)))
-        chunks, chunk_id = [], 1
+        chunks, chunk_id = [], 0
         for i in range(0, len(words), step):
             w = words[i:i + chunk_size]
             if not w:
                 break
             chunks.append({
                 "chunk_id":    chunk_id,
-                "page_number": (i // chunk_size) + 1,
+                "page_number": None,
                 "text":        " ".join(w),
                 "word_count":  len(w),
                 "file_type":   ext.lstrip("."),

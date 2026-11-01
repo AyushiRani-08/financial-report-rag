@@ -12,8 +12,13 @@ Handles:
 4. Footnotes: Binds footnotes directly to table blocks.
 5. Table-Aware Chunking: Keeps tables atomic when possible; when splitting is
    unavoidable, repeats caption, unit context, and column headers on every chunk.
+
+Layout extraction lives in pdf_parser (PyMuPDF find_tables) and html_parser
+(BeautifulSoup <table>); both build TableBlocks through `table_block_from_grid`
+and hand the ordered block list to `chunk_document_blocks`.
 """
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -32,6 +37,13 @@ FOOTNOTE_PREFIX_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+# A cell that is purely a reported amount (thousands separators or a decimal).
+MONEY_CELL_REGEX = re.compile(
+    r"^\s*[\(\[\$€£₹]?\s*[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?\s*%?\s*[\)\]]?\s*$"
+    r"|^\s*[\(\[\$€£₹]?\s*[-+]?\d+\.\d+\s*%?\s*[\)\]]?\s*$"
+)
+ALPHA_REGEX = re.compile(r"[A-Za-z]")
+
 
 @dataclass
 class TableBlock:
@@ -41,9 +53,10 @@ class TableBlock:
     headers: List[str] = field(default_factory=list)
     rows: List[List[str]] = field(default_factory=list)
     footnotes: List[str] = field(default_factory=list)
-    page_start: int = 1
-    page_end: int = 1
+    page_start: Optional[int] = None
+    page_end: Optional[int] = None
     bbox: Optional[Tuple[float, float, float, float]] = None
+    section: str = ""
 
     @property
     def col_count(self) -> int:
@@ -62,7 +75,14 @@ class TableBlock:
 class TextBlock:
     """Represents narrative text outside tables."""
     text: str
-    page_number: int
+    page_number: Optional[int] = None
+    section: str = ""
+
+
+def content_hash(text: str) -> str:
+    """Stable hash of normalised chunk text, used to drop duplicate chunks."""
+    normalized = re.sub(r"\s+", " ", (text or "")).strip().lower()
+    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
 
 
 def clean_cell_text(text: Optional[str]) -> str:
@@ -96,10 +116,125 @@ def extract_unit_context(text: str) -> Optional[str]:
     return None
 
 
+def detect_statement_scope(text: str) -> str:
+    """'consolidated' | 'standalone' | 'unspecified', read from the source text."""
+    lowered = (text or "").lower()
+    if any(
+        marker in lowered
+        for marker in ("parent company only", "standalone", "unconsolidated", "company only")
+    ):
+        return "standalone"
+    if "consolidated" in lowered:
+        return "consolidated"
+    return "unspecified"
+
+
 def is_footnote_text(text: str) -> bool:
     """Determines if a text line is a footnote."""
     stripped = text.strip()
     return bool(FOOTNOTE_PREFIX_REGEX.match(stripped))
+
+
+def _row_is_header(row: List[str]) -> bool:
+    """A header row has words and no reported amounts."""
+    cells = [c for c in row if c]
+    if not cells:
+        return False
+    has_alpha = any(ALPHA_REGEX.search(c) for c in cells)
+    has_money = any(MONEY_CELL_REGEX.match(c) for c in cells)
+    return has_alpha and not has_money
+
+
+def count_amount_rows(grid: List[List[str]]) -> int:
+    """Rows holding at least one cell that is purely a reported amount."""
+    return sum(
+        1
+        for row in grid
+        if any(MONEY_CELL_REGEX.match(clean_cell_text(c)) for c in row if c)
+    )
+
+
+def looks_like_financial_table(grid: List[List[str]], min_amount_rows: int = 2) -> bool:
+    """
+    Distinguishes a statement from a layout grid (cover page, address block,
+    infographic). Statements carry at least two rows of amounts across two columns.
+    """
+    rows = [row for row in grid if any(clean_cell_text(c) for c in row)]
+    if len(rows) < 2:
+        return False
+    if max(len(row) for row in rows) < 2:
+        return False
+    return count_amount_rows(rows) >= min_amount_rows
+
+
+def grid_to_text(grid: List[List[str]]) -> str:
+    """Flattens a rejected grid into readable text so no content is dropped."""
+    lines = []
+    for row in grid:
+        cells = [clean_cell_text(c) for c in row if clean_cell_text(c)]
+        if cells:
+            lines.append(" | ".join(cells))
+    return "; ".join(lines)
+
+
+def split_header_rows(
+    rows: List[List[str]], max_header_rows: int = 2
+) -> Tuple[List[List[str]], List[List[str]]]:
+    """Peels leading header rows off a raw table grid."""
+    body = list(rows)
+    header_rows: List[List[str]] = []
+    for _ in range(max_header_rows):
+        if not body:
+            break
+        if _row_is_header(body[0]):
+            header_rows.append(body.pop(0))
+        else:
+            break
+    return header_rows, body
+
+
+def table_block_from_grid(
+    grid: List[List[str]],
+    caption: str = "",
+    unit_context: str = "",
+    section: str = "",
+    page_start: Optional[int] = None,
+    page_end: Optional[int] = None,
+) -> Optional[TableBlock]:
+    """Builds a TableBlock from a raw grid of cell strings."""
+    rows = [[clean_cell_text(cell) for cell in row] for row in (grid or [])]
+    rows = [row for row in rows if any(cell for cell in row)]
+    if not rows:
+        return None
+
+    header_rows, body = split_header_rows(rows)
+    if not body:
+        body, header_rows = header_rows, []
+
+    headers = flatten_multitier_headers(header_rows) if header_rows else []
+    width = max([len(headers)] + [len(row) for row in body])
+    if width == 0:
+        return None
+    if len(headers) < width:
+        headers = headers + [f"Col_{i + 1}" for i in range(len(headers), width)]
+
+    if not unit_context:
+        for row in (header_rows[:2] + body[:2]):
+            found = extract_unit_context(" ".join(row))
+            if found:
+                unit_context = found
+                break
+
+    return TableBlock(
+        caption=caption or "",
+        unit_context=unit_context or "",
+        headers=headers,
+        rows=body,
+        footnotes=[],
+        page_start=page_start,
+        page_end=page_end if page_end is not None else page_start,
+        section=section or "",
+    )
 
 
 def flatten_multitier_headers(header_rows: List[List[str]]) -> List[str]:
@@ -164,11 +299,13 @@ def table_to_markdown_chunks(
     # 1. Build Header Block
     caption_part = table.caption if table.caption else "Financial Table"
     unit_part = f" | Unit Context: {table.unit_context}" if table.unit_context else ""
-    page_part = (
-        f" | Page: {table.page_start}"
-        if table.page_start == table.page_end
-        else f" | Pages: {table.page_start}-{table.page_end}"
-    )
+    page_part = ""
+    if table.page_start is not None:
+        page_part = (
+            f" | Page: {table.page_start}"
+            if table.page_start == table.page_end
+            else f" | Pages: {table.page_start}-{table.page_end}"
+        )
 
     col_count = table.col_count
     if col_count == 0:
@@ -194,6 +331,18 @@ def table_to_markdown_chunks(
         escaped_cells = [c.replace("|", "\\|") for c in cells]
         formatted_rows.append("| " + " | ".join(escaped_cells) + " |")
 
+    scope = detect_statement_scope(
+        f"{table.caption} {table.unit_context} {' '.join(table.headers)}"
+    )
+    base_meta = {
+        "page_number": table.page_start,
+        "is_table": True,
+        "table_caption": table.caption,
+        "unit_context": table.unit_context,
+        "section": table.section,
+        "statement_scope": scope,
+    }
+
     # If small enough, keep as 1 atomic chunk
     full_table_text = (
         f"[{caption_part}{unit_part}{page_part}]\n"
@@ -209,10 +358,7 @@ def table_to_markdown_chunks(
             {
                 "text": full_table_text,
                 "word_count": full_words,
-                "page_number": table.page_start,
-                "is_table": True,
-                "table_caption": table.caption,
-                "unit_context": table.unit_context,
+                **base_meta,
             }
         ]
 
@@ -261,10 +407,7 @@ def table_to_markdown_chunks(
             {
                 "text": part_text,
                 "word_count": len(part_text.split()),
-                "page_number": table.page_start,
-                "is_table": True,
-                "table_caption": table.caption,
-                "unit_context": table.unit_context,
+                **base_meta,
             }
         )
 
@@ -279,6 +422,8 @@ def can_stitch_tables(t1: TableBlock, t2: TableBlock) -> bool:
       - Column counts match
       - Similar column headers or continuation markers in t2 caption/headers
     """
+    if t2.page_start is None or t1.page_end is None:
+        return False
     if t2.page_start != t1.page_end + 1:
         return False
     if t1.col_count != t2.col_count or t1.col_count == 0:
@@ -334,7 +479,7 @@ def stitch_tables(tables: List[TableBlock]) -> List[TableBlock]:
 
 def chunk_document_blocks(
     blocks: List[Any],  # List[TextBlock | TableBlock]
-    chunk_size: int = 500,
+    chunk_size: int = 300,
     overlap_pct: float = 0.10,
 ) -> List[Dict[str, Any]]:
     """
@@ -366,18 +511,32 @@ def chunk_document_blocks(
 
             for i in range(0, len(words), step):
                 chunk_words = words[i : i + chunk_size]
+                chunk_text = " ".join(chunk_words)
                 final_chunks.append(
                     {
                         "chunk_id": global_id,
                         "word_count": len(chunk_words),
                         "page_number": block.page_number,
-                        "text": " ".join(chunk_words),
+                        "text": chunk_text,
                         "is_table": False,
+                        "table_caption": "",
+                        "unit_context": "",
+                        "section": block.section,
+                        "statement_scope": detect_statement_scope(chunk_text),
                     }
                 )
                 global_id += 1
 
                 if i + chunk_size >= len(words):
                     break
+
+    for chunk in final_chunks:
+        chunk.setdefault("page_number", None)
+        chunk.setdefault("is_table", False)
+        chunk.setdefault("table_caption", "")
+        chunk.setdefault("unit_context", "")
+        chunk.setdefault("section", "")
+        chunk.setdefault("statement_scope", "unspecified")
+        chunk["content_hash"] = content_hash(chunk["text"])
 
     return final_chunks

@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 
 from auth.session import require_auth, render_sidebar_user, logout
 from ui import apply_theme, render_settings_section
+from utils.periods import expected_duration_days
 
 load_dotenv()
 
@@ -95,16 +96,18 @@ def get_tickers(_conn) -> list[str]:
 @st.cache_data(ttl=30)
 def get_facts(_conn, ticker: str, fields: list[str]) -> pd.DataFrame:
     """
-    Fetch deduplicated facts: one row per (canonical_field, period_end).
-    Uses MAX(value) to handle duplicates from double-ingestion.
+    Fetch one row per reported fact. Selection between the overlapping
+    durations a filing reports (3M / 6M / 9M / 12M) happens in pandas.
     """
     if _conn is None:
         return pd.DataFrame()
     query = """
-        SELECT
+        SELECT DISTINCT
             ff.canonical_field,
-            MAX(ff.value)       AS value,
+            ff.value,
             ff.unit,
+            ff.tag,
+            ff.duration_days,
             fi.fiscal_period,
             ff.period_start,
             ff.period_end
@@ -115,7 +118,6 @@ def get_facts(_conn, ticker: str, fields: list[str]) -> pd.DataFrame:
           AND ff.canonical_field = ANY(%s)
           AND ff.period_end IS NOT NULL
           AND ff.value IS NOT NULL
-        GROUP BY ff.canonical_field, ff.unit, fi.fiscal_period, ff.period_start, ff.period_end
         ORDER BY ff.period_end
     """
     try:
@@ -193,12 +195,16 @@ if df.empty:
     st.warning(f"No reported facts located for symbol: {selected_ticker}.")
     st.stop()
 
-# Deduplicate: keep longest period per fiscal_period per field
+# One fact per (field, period): prefer the duration that matches the period
+# (91 days for a quarter, 365 for a year) instead of the longest one, which
+# would turn a Q2 into cumulative six-month figures.
 df["period_end"] = pd.to_datetime(df["period_end"])
-df["period_start"] = pd.to_datetime(df["period_start"])
-df["duration"] = (df["period_end"] - df["period_start"]).dt.days.fillna(0)
+df["expected_days"] = df["fiscal_period"].map(expected_duration_days)
+df["duration_penalty"] = (
+    pd.to_numeric(df["duration_days"], errors="coerce").fillna(-1) - df["expected_days"]
+).abs()
 df = (
-    df.sort_values("duration", ascending=False)
+    df.sort_values(["duration_penalty", "period_end", "tag"], ascending=[True, False, True])
     .drop_duplicates(subset=["canonical_field", "fiscal_period"])
     .sort_values("period_end")
 )

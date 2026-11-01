@@ -41,6 +41,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from generation.generator import RAGGenerator
 from indexing.vector_store import VectorStore
+from utils.periods import expected_duration_days
 
 load_dotenv()
 
@@ -171,6 +172,7 @@ def fetch_quant_ground_truths(conn, ticker_filter=None, period_filter=None) -> l
             ff.canonical_field,
             ff.value,
             ff.unit,
+            ff.duration_days,
             ff.period_start, ff.period_end
         FROM financial_facts ff
         JOIN filings fi   ON fi.filing_id  = ff.filing_id
@@ -182,11 +184,19 @@ def fetch_quant_ground_truths(conn, ticker_filter=None, period_filter=None) -> l
         cur.execute(query, params)
         rows = cur.fetchall()
 
-    # Deduplicate: first occurrence has the latest reporting period_end for that fiscal period
+    def _key(r: dict):
+        expected = expected_duration_days(r["fiscal_period"])
+        duration = r.get("duration_days")
+        penalty = 0 if (expected is None or duration is None) else abs(int(duration) - expected)
+        end = r.get("period_end")
+        return (penalty, -(end.toordinal() if end else 0))
+
+    # One fact per (ticker, period, field): the duration matching the period,
+    # not merely the first row the database returned.
     seen = {}
     for r in rows:
         key = (r["ticker"], r["fiscal_period"], r["canonical_field"])
-        if key not in seen:
+        if key not in seen or _key(r) < _key(seen[key]):
             seen[key] = dict(r)
 
     return list(seen.values())

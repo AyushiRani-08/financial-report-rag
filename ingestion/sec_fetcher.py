@@ -8,9 +8,10 @@ SEC APIs used (free, no auth):
 """
 
 import os
+import re
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional, Callable
 
 import requests
@@ -27,6 +28,7 @@ EDGAR_HEADERS = {
 
 # US-GAAP tag -> normalized canonical field (single source of truth)
 from utils.canonical_map import CANONICAL_MAP
+from utils.periods import infer_fiscal_period
 
 
 
@@ -94,27 +96,40 @@ def _infer_fiscal_period(
     fy: Optional[int] = None,
     fp: Optional[str] = None,
 ) -> Optional[str]:
-    """Convert period end date + SEC fy/fp + form type to a canonical fiscal period label e.g. FY2025, Q1FY2024."""
-    if fy and fp:
-        fp_clean = str(fp).strip().upper()
-        if fp_clean in ("Q1", "Q2", "Q3", "Q4"):
-            return f"{fp_clean}FY{fy}"
-        elif fp_clean in ("FY", "CY"):
-            return f"FY{fy}"
+    """Canonical fiscal-period label (e.g. FY2025, Q2FY2025).
 
+    Delegates to utils.periods so the SEC track and the filename/upload track
+    cannot drift apart.
+    """
+    return infer_fiscal_period(period_end, form, fy, fp)
+
+
+_DURATION_UNIT_RE = re.compile(r"^\s*([A-Za-z0-9]+)\s*/\s*([A-Za-z0-9]+)\s*$")
+
+
+def _normalize_unit(unit_label: str) -> str:
+    """'USD/shares' -> 'USD/share'. Never silently drop the numerator."""
+    raw = (unit_label or "").strip()
+    if not raw:
+        return ""
+    match = _DURATION_UNIT_RE.match(raw)
+    if match:
+        numerator = match.group(1).split(":")[-1]
+        denominator = match.group(2).split(":")[-1]
+        if denominator.lower() in ("shares", "share"):
+            denominator = "share"
+        return f"{numerator}/{denominator}"
+    return raw.split(":")[-1]
+
+
+def _parse_date_optional(value) -> Optional[date]:
+    if not value:
+        return None
     try:
-        d = datetime.strptime(period_end, "%Y-%m-%d")
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
     except (ValueError, TypeError):
         return None
-    year, month = d.year, d.month
-    if "10-K" in form or "20-F" in form:
-        return f"FY{year}"
-    elif "10-Q" in form:
-        if month <= 3:   return f"Q1FY{year}"
-        elif month <= 6: return f"Q2FY{year}"
-        elif month <= 9: return f"Q3FY{year}"
-        else:            return f"Q4FY{year}"
-    return None
+
 
 
 def _get_or_create_company(cur, ticker, name, cik, market="US") -> int:
@@ -218,15 +233,37 @@ def fetch_and_store_xbrl(
                     tag_name[0].lower() + tag_name[1:],
                 )
                 for unit_label, fact_list in tag_data.get("units", {}).items():
-                    unit = unit_label.split("/")[-1] if "/" in unit_label else unit_label
+                    unit = _normalize_unit(unit_label)
 
                     for fact in fact_list:
                         fact_form = fact.get("form", "")
                         if form_type not in fact_form:
                             continue
-                        period_end = fact.get("end") or fact.get("instant", "")
+
+                        period_end_raw = fact.get("end") or fact.get("instant", "")
+                        period_start_raw = fact.get("start")
+
+                        # A balance-sheet fact is an instant; an income/cash-flow
+                        # fact is a duration. Both are stored, but tagged, so the
+                        # reader can tell 3M / 6M / 9M / 12M periods apart.
+                        if period_start_raw and period_end_raw:
+                            start_d = _parse_date_optional(period_start_raw)
+                            end_d = _parse_date_optional(period_end_raw)
+                            if start_d is None or end_d is None:
+                                continue
+                            duration_days = (end_d - start_d).days
+                            is_instant = False
+                        elif period_end_raw:
+                            start_d = None
+                            if _parse_date_optional(period_end_raw) is None:
+                                continue
+                            duration_days = None
+                            is_instant = True
+                        else:
+                            continue
+
                         inferred = _infer_fiscal_period(
-                            period_end, fact_form, fact.get("fy"), fact.get("fp")
+                            period_end_raw, fact_form, fact.get("fy"), fact.get("fp")
                         )
                         if not inferred:
                             continue
@@ -239,27 +276,28 @@ def fetch_and_store_xbrl(
                         filing_id = _get_or_create_filing(
                             cur, company_id, fact_form, inferred, source_url
                         )
-                        try:
-                            value = float(fact.get("val", 0))
-                            cur.execute(
-                                "INSERT INTO financial_facts "
-                                "(filing_id, tag, canonical_field, value, unit, "
-                                "period_start, period_end, source_page) "
-                                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                                (
-                                    filing_id,
-                                    f"us-gaap:{tag_name}",
-                                    canonical,
-                                    value,
-                                    unit,
-                                    fact.get("start"),
-                                    period_end,
-                                    None,
-                                ),
-                            )
+                        cur.execute(
+                            "INSERT INTO financial_facts "
+                            "(filing_id, tag, canonical_field, value, unit, "
+                            "period_start, period_end, duration_days, is_instant, source_page) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                            "ON CONFLICT DO NOTHING",
+                            (
+                                filing_id,
+                                f"us-gaap:{tag_name}",
+                                canonical,
+                                float(fact.get("val", 0)),
+                                unit,
+                                start_d,
+                                period_end_raw,
+                                duration_days,
+                                is_instant,
+                                None,
+                            ),
+                        )
+                        if cur.rowcount:
                             total_inserted += 1
-                        except Exception:
-                            conn.rollback()
+
 
         _log(f"Done: {total_inserted:,} facts inserted | Periods: {sorted(periods_found)}")
 
@@ -273,6 +311,52 @@ def fetch_and_store_xbrl(
         "facts_inserted": total_inserted,
         "periods_found": sorted(periods_found),
     }
+
+
+def resolve_period_for_report_date(
+    ticker: str,
+    report_date: Optional[str],
+    dsn: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Return the fiscal-period label stored for the filing whose period ends on
+    ``report_date``.
+
+    The filename alone cannot tell a Q2 from an FY for companies with a
+    non-calendar fiscal year, so the SEC path resolves the label from the XBRL
+    facts that were just imported.
+    """
+    dsn = dsn or os.environ.get("POSTGRES_DSN")
+    if not dsn or not report_date:
+        return None
+    try:
+        conn = psycopg2.connect(dsn)
+    except psycopg2.Error:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT fi.fiscal_period
+                FROM filings fi
+                JOIN companies c ON c.company_id = fi.company_id
+                JOIN financial_facts ff ON ff.filing_id = fi.filing_id
+                WHERE c.ticker = %s
+                  AND ff.period_end IS NOT NULL
+                GROUP BY fi.fiscal_period
+                ORDER BY MIN(ABS(ff.period_end - %s::date)) ASC,
+                         MAX(ff.period_end) DESC
+                LIMIT 1
+                """,
+                (ticker.upper().strip(), report_date),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+    except psycopg2.Error as exc:
+        logger.warning("Could not resolve fiscal period for %s: %s", ticker, exc)
+        return None
+    finally:
+        conn.close()
 
 
 def get_primary_filing_info(

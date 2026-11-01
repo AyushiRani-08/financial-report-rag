@@ -2,11 +2,15 @@
 retrieval/xbrl_retriever.py
 Query structured financial facts from PostgreSQL to augment RAG prompts.
 Uses the normalized schema: companies -> filings -> financial_facts.
+
+Facts are selected deterministically: for a given fiscal period the reader
+picks the row whose duration matches the period (91 days for a quarter,
+365 for a year) instead of relying on insertion order.
 """
 import os
+import re
 import logging
-import threading
-import time
+from datetime import date
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -15,11 +19,38 @@ import psycopg2.extras
 import psycopg2.pool
 
 from utils.canonical_map import DEFAULT_CANONICAL_FIELDS
+from utils.periods import (
+    expected_duration_days,
+    parse_period_label,
+    to_date,
+    years_mentioned,
+)
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+
+def _pick_best_fact(rows: list[dict], label: str) -> dict:
+    """
+    Choose one row per (field, period).
+
+    A single filing reports the same line item over several overlapping
+    durations (3M / 6M / 9M / 12M) plus prior-year comparatives. Pick the row
+    whose duration is closest to the period label, then the latest period end.
+    """
+    expected = expected_duration_days(label)
+
+    def sort_key(row: dict):
+        duration = row.get("duration_days")
+        if duration is None or expected is None:
+            penalty = 0
+        else:
+            penalty = abs(int(duration) - expected)
+        period_end = to_date(row.get("period_end"))
+        return (penalty, -(period_end.toordinal() if period_end else 0))
+
+    return min(rows, key=sort_key)
 
 
 class XBRLRetriever:
@@ -66,14 +97,14 @@ class XBRLRetriever:
 
         Args:
             ticker:           Stock ticker symbol (e.g. 'AAPL').
-            fiscal_period:    e.g. 'FY2025' or 'Q3-2025'. None = latest available.
+            fiscal_period:    e.g. 'FY2025' or 'Q3FY2025'. None = latest available.
             canonical_fields: List of normalized field names to retrieve.
                               Defaults to DEFAULT_CANONICAL_FIELDS.
             limit_periods:    How many distinct filing periods to return (default 1).
 
         Returns:
-            List of dicts with keys: canonical_field, value, unit, period_end,
-            form_type, fiscal_period, tag.
+            List of dicts with keys: canonical_field, value, unit, period_start,
+            period_end, duration_days, is_instant, form_type, fiscal_period, tag.
         """
         fields = canonical_fields or DEFAULT_CANONICAL_FIELDS
 
@@ -88,44 +119,23 @@ class XBRLRetriever:
                 ff.canonical_field,
                 ff.value,
                 ff.unit,
+                ff.period_start,
                 ff.period_end,
+                ff.duration_days,
+                ff.is_instant,
                 fi.form_type,
                 fi.fiscal_period,
-                ff.tag,
-                ff.source_page
+                ff.tag
             FROM financial_facts ff
             JOIN filings fi ON fi.filing_id = ff.filing_id
             JOIN companies c  ON c.company_id = fi.company_id
             WHERE c.ticker = %s
               AND ff.canonical_field = ANY(%s)
+              AND ff.value IS NOT NULL
               {period_filter}
-            ORDER BY fi.fiscal_period DESC, ff.canonical_field
-            LIMIT (
-                SELECT COUNT(DISTINCT ff2.canonical_field)
-                FROM financial_facts ff2
-                JOIN filings fi2 ON fi2.filing_id = ff2.filing_id
-                JOIN companies c2 ON c2.company_id = fi2.company_id
-                WHERE c2.ticker = %s
-            ) * %s
-        """
-        # Simpler flat query:
-        query = f"""
-            SELECT
-                ff.canonical_field,
-                ff.value,
-                ff.unit,
-                ff.period_end,
-                fi.form_type,
-                fi.fiscal_period,
-                ff.tag,
-                ff.source_page
-            FROM financial_facts ff
-            JOIN filings fi ON fi.filing_id = ff.filing_id
-            JOIN companies c  ON c.company_id = fi.company_id
-            WHERE c.ticker = %s
-              AND ff.canonical_field = ANY(%s)
-              {period_filter}
-            ORDER BY fi.fiscal_period DESC, ff.canonical_field
+            ORDER BY ff.period_end DESC NULLS LAST,
+                     ff.duration_days DESC NULLS LAST,
+                     ff.fact_id DESC
         """
 
         conn = self.conn
@@ -145,11 +155,14 @@ class XBRLRetriever:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT DISTINCT fi.fiscal_period
+                        SELECT fi.fiscal_period
                         FROM filings fi
                         JOIN companies c ON c.company_id = fi.company_id
+                        LEFT JOIN financial_facts ff ON ff.filing_id = fi.filing_id
                         WHERE c.ticker = %s
-                        ORDER BY fi.fiscal_period DESC
+                        GROUP BY fi.fiscal_period
+                        ORDER BY MAX(ff.period_end) DESC NULLS LAST,
+                                 fi.fiscal_period DESC
                         """,
                         (ticker,),
                     )
@@ -199,68 +212,80 @@ class XBRLRetriever:
             logger.debug("No XBRL facts found for ticker=%s period=%s", ticker, fiscal_period)
             return ""
 
-        # Group facts by fiscal_period -> canonical_field
-        by_period: dict[str, dict[str, dict]] = {}
+        # Group -> pick exactly one deterministic fact per (period, field)
+        grouped: dict[str, dict[str, list[dict]]] = {}
         for f in facts:
-            p = f["fiscal_period"] or "Latest"
-            if p not in by_period:
-                by_period[p] = {}
-            field = f["canonical_field"]
-            p_end = str(f.get("period_end") or "")
-            if field not in by_period[p] or p_end > str(by_period[p][field].get("period_end") or ""):
-                by_period[p][field] = f
+            period = f["fiscal_period"] or "Latest"
+            grouped.setdefault(period, {}).setdefault(f["canonical_field"], []).append(f)
 
-        # Determine which periods to format
+        by_period: dict[str, dict[str, dict]] = {
+            period: {field: _pick_best_fact(rows, period) for field, rows in fields.items()}
+            for period, fields in grouped.items()
+        }
+
+        def _period_end(period: str) -> date:
+            ends = [to_date(r.get("period_end")) for r in by_period[period].values()]
+            ends = [e for e in ends if e]
+            return max(ends) if ends else date.min
+
+        ordered_periods = sorted(by_period.keys(), key=_period_end, reverse=True)
+
         selected_periods: list[str] = []
         if fiscal_period and fiscal_period in by_period:
             selected_periods = [fiscal_period]
         elif query:
             q_lower = query.lower()
-            # Match specific years and quarters in query
-            for p in by_period.keys():
-                p_lower = p.lower()
-                # Check for explicit year match (e.g. 2024, 2023)
-                for y in ("2026", "2025", "2024", "2023", "2022", "2021", "2020"):
-                    if y in q_lower and y in p_lower:
-                        if ("q1" in q_lower or "first quarter" in q_lower) and "q1" in p_lower:
-                            if p not in selected_periods: selected_periods.append(p)
-                        elif ("q2" in q_lower or "second quarter" in q_lower) and "q2" in p_lower:
-                            if p not in selected_periods: selected_periods.append(p)
-                        elif ("q3" in q_lower or "third quarter" in q_lower) and "q3" in p_lower:
-                            if p not in selected_periods: selected_periods.append(p)
-                        elif ("q4" in q_lower or "fourth quarter" in q_lower) and "q4" in p_lower:
-                            if p not in selected_periods: selected_periods.append(p)
-                        elif not any(q in q_lower for q in ("q1", "q2", "q3", "q4", "first quarter", "second quarter", "third quarter", "fourth quarter")):
-                            if p not in selected_periods: selected_periods.append(p)
-            
-            # Also check if query asks for prior year / YoY comparison
-            if any(term in q_lower for term in ("prior year", "compare", "yoy", "growth", "previous year", "last year")):
-                for p in list(by_period.keys()):
-                    if ("2023" in p or "2022" in p) and p not in selected_periods:
-                        selected_periods.append(p)
+            wanted_years = set(years_mentioned(q_lower))
+            quarter_match = re.search(r"\bq([1-4])\b", q_lower)
+            wants_quarter = int(quarter_match.group(1)) if quarter_match else None
+
+            for period in ordered_periods:
+                parsed = parse_period_label(period)
+                if not parsed:
+                    continue
+                if wanted_years and parsed["year"] not in wanted_years:
+                    continue
+                if (
+                    wants_quarter
+                    and parsed["kind"] == "Q"
+                    and parsed["quarter"] != wants_quarter
+                ):
+                    continue
+                selected_periods.append(period)
 
         if not selected_periods:
-            # Default to top 3 most recent periods
-            selected_periods = list(by_period.keys())[:3]
+            # Default to the most recent periods by actual period end date
+            selected_periods = ordered_periods[:3]
 
         blocks = []
-        for p in selected_periods:
-            if p not in by_period:
+        for period in selected_periods:
+            if period not in by_period:
                 continue
-            lines = [
-                f"[Structured Financial Data | {ticker} | {p}]",
-                "-" * 55,
-            ]
-            for field, f in sorted(by_period[p].items()):
-                val = f["value"]
-                unit = f["unit"] or ""
+
+            sample = next(iter(by_period[period].values()), {})
+            form_type = sample.get("form_type") or ""
+            period_end = _period_end(period)
+            header = f"[Structured Financial Data | {ticker} | {period}"
+            if form_type:
+                header += f" | {form_type}"
+            header += "]"
+
+            lines = [header, "-" * 62]
+            if period_end != date.min:
+                lines.append(f"  Period end: {period_end.isoformat()}")
+
+            for field, fact in sorted(by_period[period].items()):
+                value = fact["value"]
+                unit = fact["unit"] or ""
                 label = field.replace("_", " ").title()
-                if val is not None:
-                    formatted = f"{val:,.2f}" if abs(val) >= 1 else f"{val:.4f}"
+                if value is not None:
+                    numeric = float(value)
+                    formatted = f"{numeric:,.2f}" if abs(numeric) >= 1 else f"{numeric:.4f}"
                     lines.append(f"  {label:<30} {formatted:>18} {unit}")
                 else:
                     lines.append(f"  {label:<30} {'N/A':>18}")
-            lines.append("-" * 55)
+
+            lines.append("-" * 62)
             blocks.append("\n".join(lines))
 
         return "\n\n".join(blocks)

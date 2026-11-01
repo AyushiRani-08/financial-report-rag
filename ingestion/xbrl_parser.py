@@ -55,20 +55,22 @@ def _local_tag(element) -> str:
 
 
 def _ns_prefix(element) -> str:
-    """Return the namespace prefix: {http://fasb.org/us-gaap/2025}X → us-gaap"""
+    """Return the namespace prefix: {http://fasb.org/us-gaap/2025}X → us-gaap
+
+    Matched by URI prefix so new taxonomy years (2026, 2027, …) keep working
+    instead of silently dropping every fact.
+    """
     tag = element.tag
     if "}" not in tag:
         return ""
     uri = tag[1:tag.index("}")]
-    # Map known URIs to prefixes
-    uri_map = {
-        "http://fasb.org/us-gaap/2025": "us-gaap",
-        "http://fasb.org/us-gaap/2024": "us-gaap",
-        "http://fasb.org/us-gaap/2023": "us-gaap",
-        "http://xbrl.sec.gov/dei/2025": "dei",
-        "http://xbrl.sec.gov/dei/2024": "dei",
-    }
-    return uri_map.get(uri, "")
+    if uri.startswith("http://fasb.org/us-gaap/") or uri.startswith("https://fasb.org/us-gaap/"):
+        return "us-gaap"
+    if uri.startswith("http://xbrl.sec.gov/dei/") or uri.startswith("https://xbrl.sec.gov/dei/"):
+        return "dei"
+    if uri.startswith("http://xbrl.ifrs.org/taxonomy/"):
+        return "ifrs-full"
+    return ""
 
 
 def _build_context_map(root) -> dict[str, dict]:
@@ -99,29 +101,43 @@ def _build_context_map(root) -> dict[str, dict]:
                 "period_start": None,
                 "period_end":   _parse_date(instant.text),
                 "is_instant":   True,
+                "duration_days": None,
             }
         elif start is not None and end is not None:
+            start_d = _parse_date(start.text)
+            end_d = _parse_date(end.text)
+            duration = (end_d - start_d).days if (start_d and end_d) else None
             contexts[ctx_id] = {
-                "period_start": _parse_date(start.text),
-                "period_end":   _parse_date(end.text),
+                "period_start": start_d,
+                "period_end":   end_d,
                 "is_instant":   False,
+                "duration_days": duration,
             }
 
     return contexts
 
 
 def _build_unit_map(root) -> dict[str, str]:
-    """Build a dict of unitId → unit label (USD, shares, etc.)"""
+    """Build a dict of unitId → unit label ('USD', 'USD/share', 'shares')."""
     units = {}
     ns_xbrli = "http://www.xbrl.org/2003/instance"
 
     for unit in root.iter(f"{{{ns_xbrli}}}unit"):
         uid = unit.get("id", "")
-        measure = unit.find(f"{{{ns_xbrli}}}measure")
-        if measure is not None and measure.text:
-            # 'iso4217:USD' → 'USD', 'xbrli:shares' → 'shares'
-            label = measure.text.split(":")[-1]
-            units[uid] = label
+        measures = [
+            measure.text.split(":")[-1]
+            for measure in unit.iter(f"{{{ns_xbrli}}}measure")
+            if measure.text
+        ]
+        if not measures:
+            continue
+        if len(measures) >= 2:
+            denominator = measures[1]
+            if denominator.lower() in ("shares", "share"):
+                denominator = "share"
+            units[uid] = f"{measures[0]}/{denominator}"
+        else:
+            units[uid] = measures[0]
 
     return units
 
@@ -236,8 +252,9 @@ def parse_xbrl_to_db(
                     """
                     INSERT INTO financial_facts
                         (filing_id, tag, canonical_field, value, unit,
-                         period_start, period_end, source_page)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                         period_start, period_end, duration_days, is_instant, source_page)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING
                     """,
                     (
                         filing_id,
@@ -247,10 +264,13 @@ def parse_xbrl_to_db(
                         unit,
                         ctx["period_start"],
                         ctx["period_end"],
+                        ctx["duration_days"],
+                        ctx["is_instant"],
                         xbrl_path,
                     ),
                 )
-                inserted += 1
+                if cur.rowcount:
+                    inserted += 1
 
         logger.info("Inserted %d facts for %s (%s %s)", inserted, ticker, form_type, fiscal_period)
 

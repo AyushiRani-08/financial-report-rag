@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import threading
 import logging
@@ -15,6 +16,7 @@ from retrieval.xbrl_retriever import XBRLRetriever
 from utils.logger import log_query, Timer
 from utils.metadata_parser import parse_filing_metadata, COMPANY_TICKER_MAP
 from utils.abstention_guard import check_pre_retrieval_abstention
+from utils.periods import period_from_query
 from visualization import (
     extract_chart,
     get_display_text,
@@ -25,6 +27,51 @@ from visualization import (
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# Metrics that live in tables, not prose. Numeric questions get a table-first
+# retrieval pass so statement rows reach the candidate pool.
+_NUMERIC_INTENT_RE = re.compile(
+    r"\b(revenue|revenues|sales|net income|operating income|gross profit|earnings|"
+    r"eps|earnings per share|margin|margins|cash flow|free cash flow|capex|"
+    r"capital expenditures?|r&d|research and development|total assets|assets|"
+    r"liabilities|debt|equity|dividends?|buybacks?|repurchases?|inventory|"
+    r"receivables|how much|what was the|year over year|yoy)\b",
+    re.IGNORECASE,
+)
+
+# Legal-form words carry no company identity in a user question.
+_GENERIC_NAME_TOKENS = {
+    "the", "inc", "incorporated", "corp", "corporation", "company", "co", "group",
+    "holding", "holdings", "ltd", "plc", "limited", "international", "business",
+    "machines", "general", "american", "united", "national", "standard", "global",
+    "financial", "industries", "systems", "technologies", "solutions", "services",
+    "products", "partners", "capital", "trust", "bank", "energy", "health",
+}
+
+
+def _is_numeric_query(query: str) -> bool:
+    return bool(_NUMERIC_INTENT_RE.search(query or ""))
+
+
+def _qa_system_prompt() -> str:
+    """Single definition of the analyst persona shared by Q&A and streaming."""
+    return (
+        "You are an expert Senior Financial Analyst specialized in explaining corporate financial reports (10-K, 10-Q, quarterly earnings) to retail investors.\n\n"
+        "CORE REPORTING & ACCURACY RULES:\n"
+        "1. GROUNDING & EVIDENCE: Answer clearly, accurately, and concisely using ONLY the provided CONTEXT. Never speculate or fabricate.\n"
+        "2. STANDALONE VS. CONSOLIDATED: State the reporting scope only when the context states it. Label group figures as '[Consolidated]' (e.g. '[Consolidated] Total Net Sales: $391.04B') and parent-only figures as '[Standalone]'. Never assume a scope the source does not name.\n"
+        "3. XBRL VERIFIED FACTS: If STRUCTURED FINANCIAL DATA is provided at the top, treat those numbers as audited ground truth directly from SEC XBRL filings, including their stated units.\n"
+        "4. UNITS: Respect each table's unit context ('in millions', 'in thousands', 'per share'). Convert to a single stated scale before comparing figures.\n"
+        "5. ABSTENTION PROTOCOL: If the context does not contain the answer (e.g. non-disclosed divisional headcounts, daily stock prices, competitor financials, or forward-looking targets), state: 'The provided financial reports do not disclose [topic].' Do not guess.\n"
+        "6. CITATIONS: Cite the location given in each source header. Use [Page X] when a page is shown, otherwise [Section: <name>] or [Table: <caption>].\n\n"
+        "RETAIL INVESTOR ANALYSIS SECTION:\n"
+        "Unless you are abstaining/refusing due to missing data, conclude your answer with an investor analysis section formatted as follows:\n\n"
+        "### 💡 What Does This Mean for an Investor?\n"
+        "• 🟢 **Positive Signals**: 1-2 concise bullet points highlighting financial strengths, margin expansion, or capital returns shown in the data.\n"
+        "• 🟡 **Things to Monitor**: 1-2 concise bullet points highlighting key operational risks, cost pressures, or trends to watch.\n"
+        "• 📌 **Key Takeaway**: One sentence summarizing the overall implication for shareholders.\n\n"
+        f"{CHART_INSTRUCTION}"
+    )
 
 # ──────────────────────────────────────────────────────────────
 # Rate Limiter  –  simple token-bucket, one bucket per session_id
@@ -155,7 +202,11 @@ class RAGGenerator:
     elif os.getenv("POSTGRES_DSN") or _get_secret("postgres", "dsn"):
       try:
         self.xbrl_retriever = XBRLRetriever()
-      except Exception:
+      except Exception as exc:
+        logger.warning(
+            "[Generator] Structured XBRL retrieval disabled — %s. "
+            "Answers will rely on text chunks only.", exc,
+        )
         self.xbrl_retriever = None
     else:
       self.xbrl_retriever = None
@@ -242,6 +293,8 @@ class RAGGenerator:
       messages: list,
       temperature: float = 0.1,
       session_id: Optional[str] = None,
+      max_tokens: int = 4096,
+      reasoning_effort: Optional[str] = None,
   ):
       """
       Streams tokens from the LLM, falling back across models on 503/429/timeout.
@@ -262,13 +315,18 @@ class RAGGenerator:
 
           tokens_yielded = False
           try:
-              stream = self.client.chat.completions.create(
-                  model=model,
-                  messages=messages,
-                  temperature=temperature,
-                  stream=True,
-                  max_tokens=4096,
-              )
+              request = {
+                  "model": model,
+                  "messages": messages,
+                  "temperature": temperature,
+                  "stream": True,
+                  "max_tokens": max_tokens,
+              }
+              # Only gpt-oss accepts this knob; sending it to a plain fallback
+              # would 400 and burn the fallback ladder.
+              if reasoning_effort and "gpt-oss" in model:
+                  request["reasoning_effort"] = reasoning_effort
+              stream = self.client.chat.completions.create(**request)
               for chunk in stream:
                   delta = chunk.choices[0].delta.content
                   if delta:
@@ -293,15 +351,113 @@ class RAGGenerator:
               raise
       raise RuntimeError(f"All models exhausted during streaming. Last error: {last_exc}")
 
+  @staticmethod
+  def _iter_visible_text(deltas, raw_out: List[str]):
+    """Yields response text with any ```chart_data block stripped out.
+
+    The trailing buffer is flushed at end-of-stream: a chart block that never
+    closes must not silently swallow the answer.
+    """
+    in_chart = False
+    buffer = ""
+
+    for delta in deltas:
+      raw_out.append(delta)
+      if in_chart:
+        # Resume normal streaming once the chart fence closes.
+        chart_tail = "".join(raw_out).split("```chart_data", 1)[-1]
+        if "```" in chart_tail:
+          in_chart = False
+          buffer = ""
+        continue
+
+      buffer += delta
+      if "```chart_data" in buffer:
+        pre_text = buffer.split("```chart_data", 1)[0]
+        if pre_text:
+          yield pre_text
+        in_chart = True
+        buffer = ""
+      elif "```" in buffer:
+        after = buffer[buffer.find("```"):]
+        if "```chart_data".startswith(after):
+          continue
+        yield buffer
+        buffer = ""
+      else:
+        yield buffer
+        buffer = ""
+
+    if buffer:
+      yield buffer
+
+  def _stream_visible_text(
+      self,
+      messages: list,
+      temperature: float = 0.1,
+      session_id: Optional[str] = None,
+      max_tokens: int = 4096,
+      raw_tokens: Optional[List[str]] = None,
+  ):
+    """Streams visible answer text, retrying once if the model yields none.
+
+    A stream can end "successfully" with zero visible text — reasoning models
+    can spend the whole budget on the hidden reasoning channel, and a truncated
+    chart block can leave nothing behind. That used to persist an empty chat
+    bubble; now we retry with reasoning suppressed, then raise so the UI can
+    surface the failure.
+    """
+    raw_tokens = raw_tokens if raw_tokens is not None else []
+    attempts = [
+        {"max_tokens": max_tokens, "reasoning_effort": None},
+        {"max_tokens": max(max_tokens, 8192), "reasoning_effort": "low"},
+    ]
+    for attempt, opts in enumerate(attempts, start=1):
+      raw_tokens.clear()
+      emitted = 0
+      for text in self._iter_visible_text(
+          self._call_llm_stream(
+              messages=messages,
+              temperature=temperature,
+              session_id=session_id,
+              **opts,
+          ),
+          raw_tokens,
+      ):
+        emitted += len(text.strip())
+        yield text
+      if emitted:
+        return
+      logger.warning(
+          "[Generator] model returned no visible text (attempt %d/%d)",
+          attempt, len(attempts),
+      )
+    raise RuntimeError("The language model returned an empty response. Please retry.")
+
   def format_context(self, retrieved_chunks: List[Dict[str, Any]]) -> str:
-    """Formats retrieved chunks with citations into a unified context block."""
+    """Formats retrieved chunks with page/section/table provenance for citation."""
     context_parts = []
     for i, chunk in enumerate(retrieved_chunks, start=1):
-      page = chunk["metadata"].get("page_number", "1")
-      paper_id = chunk["metadata"].get("paper_id", "Unknown Document")
-      text = chunk["text"].strip()
+      meta = chunk.get("metadata") or {}
+      paper_id = meta.get("paper_id") or "Unknown Document"
+
+      location: List[str] = []
+      page = meta.get("page_number")
+      if page:
+        location.append(f"Page {page}")
+      section = (meta.get("section") or "").strip()
+      if section:
+        location.append(f"Section: {section}")
+      if meta.get("is_table"):
+        caption = (meta.get("table_caption") or "").strip()
+        location.append(f"Table: {caption or 'untitled'}")
+        units = (meta.get("unit_context") or "").strip()
+        if units:
+          location.append(f"Units: {units}")
+
+      provenance = " | ".join(location) or "unknown location"
       context_parts.append(
-          f"[Source {i} | Document: {paper_id} | Page/Section: {page}]\n{text}"
+          f"[Source {i} | Document: {paper_id} | {provenance}]\n{chunk['text'].strip()}"
       )
     return "\n\n".join(context_parts)
 
@@ -320,8 +476,60 @@ class RAGGenerator:
       return self.xbrl_retriever.to_context_string(
           ticker=ticker, fiscal_period=fiscal_period, query=query
       )
-    except Exception:
+    except Exception as exc:
+      logger.warning("[Generator] XBRL context unavailable for %s %s: %s",
+                     ticker, fiscal_period or "", exc)
       return ""
+
+  def _infer_ticker_from_query(self, query: str) -> Optional[str]:
+    """Resolve a company from the question using indexed companies, then a static map."""
+    companies = []
+    if self.xbrl_retriever:
+      try:
+        companies = self.xbrl_retriever.get_available_tickers()
+      except Exception as exc:
+        logger.debug("[Generator] Company lookup unavailable: %s", exc)
+
+    for row in companies:
+      ticker = (row.get("ticker") or "").upper()
+      if not ticker:
+        continue
+      if re.search(rf"\b{re.escape(ticker)}\b", query):
+        return ticker
+      name = (row.get("name") or "").lower()
+      tokens = [t for t in re.findall(r"[a-z]{3,}", name) if t not in _GENERIC_NAME_TOKENS]
+      if tokens and re.search(rf"\b{re.escape(tokens[0])}\b", query.lower()):
+        return ticker
+
+    lowered = query.lower()
+    for name, ticker in COMPANY_TICKER_MAP.items():
+      if len(name) >= 3 and re.search(rf"\b{re.escape(name)}\b", lowered):
+        return ticker
+    return None
+
+  def _resolve_scope(
+      self,
+      query: str,
+      paper_id: Optional[str],
+      ticker: Optional[str],
+      fiscal_period: Optional[str],
+  ) -> tuple[Optional[str], Optional[str]]:
+    """Ticker + period for retrieval, from the document, the question, or the database."""
+    active_ticker = ticker
+    active_period = fiscal_period
+
+    if paper_id:
+      inferred = parse_filing_metadata(paper_id)
+      active_ticker = active_ticker or inferred.get("ticker")
+      active_period = active_period or inferred.get("fiscal_period")
+
+    if not active_ticker:
+      active_ticker = self._infer_ticker_from_query(query)
+
+    if not active_period:
+      active_period = period_from_query(query)
+
+    return active_ticker, active_period
 
   def generate_answer(
       self, query: str, top_k: int = 3, paper_id=None,
@@ -332,42 +540,9 @@ class RAGGenerator:
     total_start = time.perf_counter()
 
     # --- Pre-Retrieval Scope Resolution (Retrieval Isolation) ---
-    active_ticker = ticker
-    active_period = fiscal_period
-
-    if paper_id:
-        inferred = parse_filing_metadata(paper_id)
-        if not active_ticker:
-            active_ticker = inferred.get("ticker")
-        if not active_period:
-            active_period = inferred.get("fiscal_period")
-
-    if not active_ticker:
-        q_lower = query.lower()
-        company_hints = {
-            "boeing": "BA", " ba ": "BA",
-            "jpmorgan": "JPM", "jp morgan": "JPM", "jpmc": "JPM", " jpm ": "JPM",
-            "tesla": "TSLA", " tsla ": "TSLA",
-            "apple": "AAPL", " aapl ": "AAPL",
-            "microsoft": "MSFT", " msft ": "MSFT",
-            "google": "GOOGL", "alphabet": "GOOGL", " googl ": "GOOGL",
-            "amazon": "AMZN", " amzn ": "AMZN",
-            "nvidia": "NVDA", " nvda ": "NVDA",
-        }
-        for hint, t_code in company_hints.items():
-            if hint in q_lower:
-                active_ticker = t_code
-                break
-
-    if not active_period:
-        import re
-        fy_match = re.search(r'\b(fy\s*20\d\d|20\d\d|q[1-4]\s*fy\s*20\d\d)\b', query.lower())
-        if fy_match:
-            raw_period = fy_match.group(1).replace(" ", "").upper()
-            if raw_period.isdigit():
-                active_period = f"FY{raw_period}"
-            else:
-                active_period = raw_period
+    active_ticker, active_period = self._resolve_scope(
+        query, paper_id, ticker, fiscal_period
+    )
 
     # --- Layer 1: Pre-Retrieval Abstention Gate ---
     abstention = check_pre_retrieval_abstention(query, ticker=active_ticker, fiscal_period=active_period)
@@ -384,6 +559,8 @@ class RAGGenerator:
             "abstained": True,
         }
 
+    prefer_tables = _is_numeric_query(query)
+
     # --- Isolated Retrieval with timing ---
     with Timer() as retrieval_timer:
       chunks = self.retriever.retrieve(
@@ -392,18 +569,21 @@ class RAGGenerator:
           paper_id=paper_id,
           ticker=active_ticker,
           fiscal_period=active_period,
-          statement_scope="consolidated",
           session_id=session_id,
+          prefer_tables=prefer_tables,
       )
 
-    # Graceful fallback: if strictly isolated search yielded 0 results, relax period or ticker
+    # Relax the period, never the company: searching every company's filings
+    # is how a Boeing question silently gets answered with Apple's numbers.
     if not chunks and active_ticker and not paper_id:
         with Timer() as retrieval_timer:
             chunks = self.retriever.retrieve(
                 query=query,
                 top_k=top_k,
                 paper_id=None,
+                ticker=active_ticker,
                 session_id=session_id,
+                prefer_tables=prefer_tables,
             )
 
     if not chunks:
@@ -434,22 +614,7 @@ class RAGGenerator:
     )
     xbrl_section = f"{xbrl_block}\n\n" if xbrl_block else ""
 
-    system_prompt = (
-        "You are an expert Senior Financial Analyst specialized in explaining corporate financial reports (10-K, 10-Q, quarterly earnings) to retail investors.\n\n"
-        "CORE REPORTING & ACCURACY RULES:\n"
-        "1. GROUNDING & EVIDENCE: Answer clearly, accurately, and concisely using ONLY the provided CONTEXT. Never speculate or fabricate.\n"
-        "2. STANDALONE VS. CONSOLIDATED: Clearly state the reporting scope. Annual 10-K filings report consolidated corporate operations. Label group figures as '[Consolidated]' (e.g. '[Consolidated] Total Net Sales: $391.04B'). If parent-only, label as '[Standalone]'.\n"
-        "3. XBRL VERIFIED FACTS: If STRUCTURED FINANCIAL DATA is provided at the top, treat those numbers as audited ground truth directly from SEC XBRL filings.\n"
-        "4. ABSTENTION PROTOCOL: If the context does not contain the answer (e.g. non-disclosed divisional headcounts, daily stock prices, competitor financials, or forward-looking targets), state: 'The provided financial reports do not disclose [topic].' Do not guess.\n"
-        "5. CITATIONS: Always cite specific page or section numbers using [Page X] notation whenever citing metrics or statements.\n\n"
-        "RETAIL INVESTOR ANALYSIS SECTION:\n"
-        "Unless you are abstaining/refusing due to missing data, conclude your answer with an investor analysis section formatted as follows:\n\n"
-        "### 💡 What Does This Mean for an Investor?\n"
-        "• 🟢 **Positive Signals**: 1-2 concise bullet points highlighting financial strengths, margin expansion, or capital returns shown in the data.\n"
-        "• 🟡 **Things to Monitor**: 1-2 concise bullet points highlighting key operational risks, cost pressures, or trends to watch.\n"
-        "• 📌 **Key Takeaway**: One sentence summarizing the overall implication for shareholders.\n\n"
-        f"{CHART_INSTRUCTION}"
-    )
+    system_prompt = _qa_system_prompt()
 
     user_prompt = f"""{xbrl_section}CONTEXT FROM FINANCIAL REPORT:
 {context}
@@ -507,39 +672,9 @@ ANALYST RESPONSE:"""
       Yields clean LLM text tokens live, suppressing any ```chart_data JSON block
       from the user-visible stream while parsing and returning it via chart_out.
       """
-      import re
-      active_ticker = ticker
-      active_period = fiscal_period
-
-      if paper_id:
-          inferred = parse_filing_metadata(paper_id)
-          if not active_ticker:
-              active_ticker = inferred.get("ticker")
-          if not active_period:
-              active_period = inferred.get("fiscal_period")
-
-      if not active_ticker:
-          q_lower = query.lower()
-          company_hints = {
-              "boeing": "BA", " ba ": "BA",
-              "jpmorgan": "JPM", "jp morgan": "JPM", "jpmc": "JPM", " jpm ": "JPM",
-              "tesla": "TSLA", " tsla ": "TSLA",
-              "apple": "AAPL", " aapl ": "AAPL",
-              "microsoft": "MSFT", " msft ": "MSFT",
-              "google": "GOOGL", "alphabet": "GOOGL", " googl ": "GOOGL",
-              "amazon": "AMZN", " amzn ": "AMZN",
-              "nvidia": "NVDA", " nvda ": "NVDA",
-          }
-          for hint, t_code in company_hints.items():
-              if hint in q_lower:
-                  active_ticker = t_code
-                  break
-
-      if not active_period:
-          fy_match = re.search(r'\b(fy\s*20\d\d|20\d\d|q[1-4]\s*fy\s*20\d\d)\b', query.lower())
-          if fy_match:
-              raw_period = fy_match.group(1).replace(" ", "").upper()
-              active_period = f"FY{raw_period}" if raw_period.isdigit() else raw_period
+      active_ticker, active_period = self._resolve_scope(
+          query, paper_id, ticker, fiscal_period
+      )
 
       # Layer 1: Pre-Retrieval Abstention Gate
       abstention = check_pre_retrieval_abstention(query, ticker=active_ticker, fiscal_period=active_period)
@@ -549,14 +684,19 @@ ANALYST RESPONSE:"""
           yield abstention["reason"]
           return
 
-      # Retrieval
+      prefer_tables = _is_numeric_query(query)
+
+      # Retrieval — period may relax, company may not
       chunks = self.retriever.retrieve(
           query=query, top_k=top_k, paper_id=paper_id,
           ticker=active_ticker, fiscal_period=active_period,
-          statement_scope="consolidated", session_id=session_id,
+          session_id=session_id, prefer_tables=prefer_tables,
       )
       if not chunks and active_ticker and not paper_id:
-          chunks = self.retriever.retrieve(query=query, top_k=top_k, session_id=session_id)
+          chunks = self.retriever.retrieve(
+              query=query, top_k=top_k, ticker=active_ticker,
+              session_id=session_id, prefer_tables=prefer_tables,
+          )
 
       if not chunks:
           if sources_out is not None:
@@ -579,69 +719,23 @@ ANALYST RESPONSE:"""
       )
       xbrl_section = f"{xbrl_block}\n\n" if xbrl_block else ""
 
-      system_prompt = (
-          "You are an expert Senior Financial Analyst specialized in explaining corporate financial reports (10-K, 10-Q, quarterly earnings) to retail investors.\n\n"
-          "CORE REPORTING & ACCURACY RULES:\n"
-          "1. GROUNDING & EVIDENCE: Answer clearly, accurately, and concisely using ONLY the provided CONTEXT. Never speculate or fabricate.\n"
-          "2. STANDALONE VS. CONSOLIDATED: Clearly state the reporting scope. Annual 10-K filings report consolidated corporate operations. Label group figures as '[Consolidated]' (e.g. '[Consolidated] Total Net Sales: $391.04B'). If parent-only, label as '[Standalone]'.\n"
-          "3. XBRL VERIFIED FACTS: If STRUCTURED FINANCIAL DATA is provided at the top, treat those numbers as audited ground truth directly from SEC XBRL filings.\n"
-          "4. ABSTENTION PROTOCOL: If the context does not contain the answer (e.g. non-disclosed divisional headcounts, daily stock prices, competitor financials, or forward-looking targets), state: 'The provided financial reports do not disclose [topic].' Do not guess.\n"
-          "5. CITATIONS: Always cite specific page or section numbers using [Page X] notation whenever citing metrics or statements.\n\n"
-          "RETAIL INVESTOR ANALYSIS SECTION:\n"
-          "Unless you are abstaining/refusing due to missing data, conclude your answer with an investor analysis section formatted as follows:\n\n"
-          "### 💡 What Does This Mean for an Investor?\n"
-          "• 🟢 **Positive Signals**: 1-2 concise bullet points highlighting financial strengths, margin expansion, or capital returns shown in the data.\n"
-          "• 🟡 **Things to Monitor**: 1-2 concise bullet points highlighting key operational risks, cost pressures, or trends to watch.\n"
-          "• 📌 **Key Takeaway**: One sentence summarizing the overall implication for shareholders.\n\n"
-          f"{CHART_INSTRUCTION}"
-      )
+      system_prompt = _qa_system_prompt()
       user_prompt = (
           f"{xbrl_section}CONTEXT FROM FINANCIAL REPORT:\n{context}\n\n"
           f"RETAIL INVESTOR QUESTION:\n{query}\n\nANALYST RESPONSE:"
       )
 
       raw_tokens: List[str] = []
-      in_chart = False
-      buffer = ""
-
-      for delta in self._call_llm_stream(
+      for text in self._stream_visible_text(
           messages=[
               {"role": "system", "content": system_prompt},
               {"role": "user",   "content": user_prompt},
           ],
           temperature=0.1,
+          session_id=session_id,
+          raw_tokens=raw_tokens,
       ):
-          raw_tokens.append(delta)
-          if in_chart:
-              # Resume normal streaming if chart block has closed with ```
-              chart_tail = "".join(raw_tokens).split("```chart_data", 1)[-1]
-              if "```" in chart_tail:
-                  in_chart = False
-                  buffer = ""
-              continue
-
-          buffer += delta
-          if "```chart_data" in buffer:
-              parts = buffer.split("```chart_data", 1)
-              pre_text = parts[0]
-              if pre_text:
-                  yield pre_text
-              in_chart = True
-              buffer = ""
-          elif "```" in buffer:
-              idx = buffer.find("```")
-              after = buffer[idx:]
-              if "```chart_data".startswith(after):
-                  continue
-              else:
-                  yield buffer
-                  buffer = ""
-          else:
-              yield buffer
-              buffer = ""
-
-      if buffer and not in_chart:
-          yield buffer
+          yield text
 
       # Extract chart and enrich with XBRL
       full_raw = "".join(raw_tokens)
@@ -660,18 +754,13 @@ ANALYST RESPONSE:"""
     """Generates a comprehensive 5-part standard retail investor financial report."""
     total_start = time.perf_counter()
 
-    active_ticker = ticker
-    active_period = fiscal_period
-    if paper_id:
-        inferred = parse_filing_metadata(paper_id)
-        if not active_ticker:
-            active_ticker = inferred.get("ticker")
-        if not active_period:
-            active_period = inferred.get("fiscal_period")
-
     report_query = (
         "Provide a comprehensive financial summary including revenue growth, net income, "
         "profitability margins, free cash flow, major risk factors, and overall strategic guidance."
+    )
+
+    active_ticker, active_period = self._resolve_scope(
+        report_query, paper_id, ticker, fiscal_period
     )
 
     with Timer() as retrieval_timer:
@@ -701,7 +790,7 @@ ANALYST RESPONSE:"""
     similarity_scores = [c["similarity_score"] for c in chunks]
 
     # --- Structured XBRL facts from PostgreSQL (prepended for grounding) ---
-    xbrl_block = self._get_xbrl_context(ticker=ticker, fiscal_period=fiscal_period)
+    xbrl_block = self._get_xbrl_context(ticker=active_ticker, fiscal_period=active_period)
     xbrl_section = f"{xbrl_block}\n\n" if xbrl_block else ""
 
     system_prompt = (
@@ -714,7 +803,7 @@ ANALYST RESPONSE:"""
         "### 4. Key Risk Factors & Market Headwinds\n"
         "### 5. Retail Investor Takeaway\n\n"
         "If STRUCTURED FINANCIAL DATA is provided at the top, use those exact figures in sections 2 and 3 — they are verified XBRL values from official filings.\n"
-        "Base all other statements strictly on the provided CONTEXT and cite pages/sections as [Page X].\n\n"
+        "Base all other statements strictly on the provided CONTEXT and cite the source location as given in each source header ([Page X], [Section: ...] or [Table: ...]).\n\n"
         f"{CHART_INSTRUCTION}"
     )
 
@@ -764,18 +853,13 @@ Generate the Standard Financial Analysis Report now."""
       Yields clean LLM text tokens live, suppressing any ```chart_data JSON block
       from the user-visible stream while parsing and returning it via chart_out.
       """
-      active_ticker = ticker
-      active_period = fiscal_period
-      if paper_id:
-          inferred = parse_filing_metadata(paper_id)
-          if not active_ticker:
-              active_ticker = inferred.get("ticker")
-          if not active_period:
-              active_period = inferred.get("fiscal_period")
-
       report_query = (
           "Provide a comprehensive financial summary including revenue growth, net income, "
           "profitability margins, free cash flow, major risk factors, and overall strategic guidance."
+      )
+
+      active_ticker, active_period = self._resolve_scope(
+          report_query, paper_id, ticker, fiscal_period
       )
 
       chunks = self.retriever.retrieve(
@@ -807,7 +891,8 @@ Generate the Standard Financial Analysis Report now."""
           "### 5. Retail Investor Takeaway\n\n"
           "If STRUCTURED FINANCIAL DATA is provided at the top, use those exact figures in "
           "sections 2 and 3 — they are verified XBRL values from official filings.\n"
-          "Base all other statements strictly on the provided CONTEXT and cite pages/sections as [Page X].\n\n"
+          "Base all other statements strictly on the provided CONTEXT and cite the source "
+          "location as given in each source header ([Page X], [Section: ...] or [Table: ...]).\n\n"
           f"{CHART_INSTRUCTION}"
       )
       user_prompt = (
@@ -816,47 +901,15 @@ Generate the Standard Financial Analysis Report now."""
       )
 
       raw_tokens: List[str] = []
-      in_chart = False
-      buffer = ""
-
-      for delta in self._call_llm_stream(
+      for text in self._stream_visible_text(
           messages=[
               {"role": "system", "content": system_prompt},
               {"role": "user",   "content": user_prompt},
           ],
           temperature=0.2,
+          raw_tokens=raw_tokens,
       ):
-          raw_tokens.append(delta)
-          if in_chart:
-              # Resume normal streaming if chart block has closed with ```
-              chart_tail = "".join(raw_tokens).split("```chart_data", 1)[-1]
-              if "```" in chart_tail:
-                  in_chart = False
-                  buffer = ""
-              continue
-
-          buffer += delta
-          if "```chart_data" in buffer:
-              parts = buffer.split("```chart_data", 1)
-              pre_text = parts[0]
-              if pre_text:
-                  yield pre_text
-              in_chart = True
-              buffer = ""
-          elif "```" in buffer:
-              idx = buffer.find("```")
-              after = buffer[idx:]
-              if "```chart_data".startswith(after):
-                  continue
-              else:
-                  yield buffer
-                  buffer = ""
-          else:
-              yield buffer
-              buffer = ""
-
-      if buffer and not in_chart:
-          yield buffer
+          yield text
 
       # Extract chart and enrich with XBRL
       full_raw = "".join(raw_tokens)

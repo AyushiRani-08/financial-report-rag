@@ -5,11 +5,13 @@ Session helpers for FinSight.
 PKCE strategy for Streamlit — how the verifier survives the redirect:
 
   PRIMARY: ?cv=verifier encoded in redirect_to URL
-  ─────────────────────────────────────────────────
+#   ─────────────────────────────────────────────────
   Supabase DOES pass through query params appended to redirect_to.
-  e.g. redirect_to = "http://localhost:8501?cv=abc123"
-  After OAuth, Supabase redirects to:  http://localhost:8501?code=XYZ&cv=abc123
+  e.g. redirect_to = "http://localhost:8501/?cv=abc123"
+  After OAuth, Supabase redirects to:  http://localhost:8501/?code=XYZ&cv=abc123
   Works as long as the redirect URL pattern is whitelisted in Supabase Dashboard.
+  The "/" before "?" is required: the allowlist entry is "http://localhost:8501/**",
+  and Supabase silently substitutes the Site URL when nothing matches.
 
   REQUIREMENT: Add these to Supabase Dashboard → Auth → Redirect URLs:
     http://localhost:8501/**
@@ -276,8 +278,13 @@ def _build_auth_url() -> str:
     challenge = _pkce_challenge(verifier)
 
     base_redirect = _get_redirect_url()
+    # The path segment matters: the Supabase allowlist entry is
+    # "http://localhost:8501/**", which only matches a URL that has a "/"
+    # after the port. "http://localhost:8501?cv=..." does NOT match and
+    # Supabase silently falls back to the project's Site URL (the deployed
+    # app) — so keep the slash before the query string.
     # ?cv= is echoed back by Supabase in the callback URL — primary verifier transport
-    redirect_with_cv = f"{base_redirect}?cv={verifier}"
+    redirect_with_cv = f"{base_redirect.rstrip('/')}/?cv={verifier}"
 
     _save_verifier(verifier)
 

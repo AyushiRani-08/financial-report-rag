@@ -31,13 +31,29 @@ CREATE TABLE IF NOT EXISTS public.embeddings (
     ticker          TEXT DEFAULT '',
     fiscal_period   TEXT DEFAULT '',
     form_type       TEXT DEFAULT '',
-    page_number     INT  DEFAULT 1,
+    page_number     INT,                       -- NULL when the source has no pages (HTML)
     word_count      INT  DEFAULT 0,
     file_type       TEXT DEFAULT '',
+    is_table        BOOLEAN DEFAULT FALSE,
+    unit_context    TEXT DEFAULT '',           -- e.g. 'in millions, except per share amounts'
+    table_caption   TEXT DEFAULT '',
+    section         TEXT DEFAULT '',           -- heading / SEC Item for page-less sources
+    statement_scope TEXT DEFAULT 'unspecified',-- 'consolidated' | 'standalone' | 'unspecified'
+    content_hash    TEXT DEFAULT '',
     content         TEXT NOT NULL,
     embedding       VECTOR(384),
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- ── 3b. Column additions for existing databases ──────────────
+ALTER TABLE public.embeddings ADD COLUMN IF NOT EXISTS is_table        BOOLEAN DEFAULT FALSE;
+ALTER TABLE public.embeddings ADD COLUMN IF NOT EXISTS unit_context    TEXT DEFAULT '';
+ALTER TABLE public.embeddings ADD COLUMN IF NOT EXISTS table_caption   TEXT DEFAULT '';
+ALTER TABLE public.embeddings ADD COLUMN IF NOT EXISTS section         TEXT DEFAULT '';
+ALTER TABLE public.embeddings ADD COLUMN IF NOT EXISTS statement_scope TEXT DEFAULT 'unspecified';
+ALTER TABLE public.embeddings ADD COLUMN IF NOT EXISTS content_hash    TEXT DEFAULT '';
+ALTER TABLE public.embeddings ALTER COLUMN page_number DROP DEFAULT;
+ALTER TABLE public.embeddings ALTER COLUMN page_number DROP NOT NULL;
 
 -- ── 4. Indexes ────────────────────────────────────────────────
 -- HNSW index for fast cosine similarity search
@@ -51,6 +67,9 @@ CREATE INDEX IF NOT EXISTS idx_embeddings_user_paper
 
 CREATE INDEX IF NOT EXISTS idx_embeddings_ticker
     ON public.embeddings (user_id, ticker);
+
+CREATE INDEX IF NOT EXISTS idx_embeddings_hash
+    ON public.embeddings (user_id, content_hash);
 
 -- ── 5. Enable Row Level Security ─────────────────────────────
 ALTER TABLE public.user_profiles   ENABLE ROW LEVEL SECURITY;

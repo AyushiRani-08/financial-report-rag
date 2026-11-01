@@ -7,7 +7,12 @@ import os
 from generation.generator import RAGGenerator
 from retrieval.retriever import Retriever
 from indexing.vector_store import VectorStore
-from ingestion.sec_fetcher import download_sec_filing, fetch_and_store_xbrl
+from ingestion.sec_fetcher import (
+    download_sec_filing,
+    fetch_and_store_xbrl,
+    resolve_period_for_report_date,
+)
+from utils.metadata_parser import COMPANY_TICKER_MAP, parse_filing_metadata
 from privacy import redact_query, get_redaction_summary, get_engine_status
 from auth.session import require_auth, logout, get_current_user, render_sidebar_user
 from visualization import render_chart
@@ -53,57 +58,36 @@ def get_indexed_documents(_collection):
         return []
 
 
-COMPANY_TICKER_MAP = {
-    "tesla": "TSLA",
-    "microsoft": "MSFT",
-    "apple": "AAPL",
-    "amazon": "AMZN",
-    "google": "GOOGL",
-    "alphabet": "GOOGL",
-    "meta": "META",
-    "facebook": "META",
-    "nvidia": "NVDA",
-    "jpmc": "JPM",
-    "jpmorgan": "JPM",
-    "jpm": "JPM",
-    "boeing": "BA",
-    "berkshire": "BRK-B",
-    "asml": "ASML",
-    "baba": "BABA",
-    "alibaba": "BABA",
-}
-
-
 def _parse_ticker_and_period(doc_name: str):
-    """
-    Detect ticker and period from filing filename or company identifier.
-    """
-    import re
-    clean = doc_name.lower().replace(".html", "").replace(".htm", "").replace(".pdf", "").strip()
+    """Ticker and period for a document name, via the shared metadata parser."""
+    meta = parse_filing_metadata(doc_name)
+    return meta.get("ticker"), meta.get("fiscal_period")
 
-    if clean in COMPANY_TICKER_MAP:
-        return COMPANY_TICKER_MAP[clean], None
 
-    m = re.match(r'^([a-zA-Z]+)[-_](\d{4})(\d{2})(\d{2})', doc_name)
-    if not m:
-        for comp, tick in COMPANY_TICKER_MAP.items():
-            if comp in clean:
-                return tick, None
-        if len(clean) in (3, 4, 5) and clean.isalpha():
-            return clean.upper(), None
-        return None, None
+def _source_label(meta: dict) -> str:
+    """Location string for a retrieved chunk: page, section, or table caption."""
+    bits = []
+    if meta.get("page_number"):
+        bits.append(f"Page {meta['page_number']}")
+    if meta.get("section"):
+        bits.append(meta["section"])
+    if meta.get("is_table"):
+        caption = meta.get("table_caption")
+        bits.append(f"Table: {caption}" if caption else "Table")
+    return " | ".join(bits) or "Section not available"
 
-    raw_prefix = m.group(1).lower()
-    ticker = COMPANY_TICKER_MAP.get(raw_prefix, m.group(1).upper())
-    year, month, day = int(m.group(2)), int(m.group(3)), int(m.group(4))
-    if month in (6, 9, 12) and day >= 28:
-        fy = year if month >= 4 else year - 1
-        period = f"FY{fy}"
-    elif month == 3:
-        period = f"Q3FY{year - 1}" if year > 2000 else None
-    else:
-        period = None
-    return ticker, period
+
+def _render_sources(sources: list) -> None:
+    with st.expander(f"Retrieved Source References ({len(sources)})"):
+        for i, src in enumerate(sources, start=1):
+            meta = src.get("metadata", {})
+            st.markdown(
+                f"**Reference {i}** &mdash; Filing: `{meta.get('paper_id', 'Unknown Document')}` "
+                f"| {_source_label(meta)}"
+            )
+            st.markdown(f"> {src.get('text', '')}")
+            if i < len(sources):
+                st.divider()
 
 
 # ── File Upload Validation Helpers ──────────────────────────────────────────
@@ -272,6 +256,18 @@ with st.sidebar:
 
                 with st.spinner(f"Retrieving data for {resolved_ticker} from SEC EDGAR..."):
                     try:
+                        # Facts first: the filing's fiscal-period label is only
+                        # knowable once the XBRL contexts are stored.
+                        _p_log(f"Extracting structured XBRL financial facts for {resolved_ticker}...")
+                        x_res = fetch_and_store_xbrl(
+                            ticker=resolved_ticker,
+                            form_type=form_code,
+                            progress_callback=_p_log,
+                        )
+
+                        f_info = None
+                        filing_period = None
+                        chunk_count = 0
                         if not fetch_facts_only:
                             f_info = download_sec_filing(
                                 ticker=resolved_ticker,
@@ -279,16 +275,16 @@ with st.sidebar:
                                 fiscal_year=year_val,
                                 progress_callback=_p_log,
                             )
+                            filing_period = resolve_period_for_report_date(
+                                resolved_ticker, f_info.get("report_date")
+                            )
                             _p_log(f"Indexing {f_info['file_name']} into vector store...")
-                            chunk_count = vector_store.add_document(f_info["file_path"])
+                            chunk_count = vector_store.add_document(
+                                f_info["file_path"],
+                                ticker=resolved_ticker,
+                                fiscal_period=filing_period,
+                            )
                             st.cache_data.clear()
-
-                        _p_log(f"Extracting structured XBRL financial facts for {resolved_ticker}...")
-                        x_res = fetch_and_store_xbrl(
-                            ticker=resolved_ticker,
-                            form_type=form_code,
-                            progress_callback=_p_log,
-                        )
 
                         prog_box.empty()
                         if not fetch_facts_only:
@@ -301,7 +297,9 @@ with st.sidebar:
 
                         st.session_state["auto_ticker"] = resolved_ticker
                         periods = x_res.get("periods_found", [])
-                        st.session_state["auto_period"] = periods[-1] if periods else None
+                        st.session_state["auto_period"] = (
+                            filing_period or (periods[-1] if periods else None)
+                        )
                         st.rerun()
                     except Exception as e:
                         prog_box.empty()
@@ -440,15 +438,7 @@ for msg in st.session_state.messages:
         if msg.get("chart_data"):
             render_chart(msg["chart_data"])
         if "sources" in msg and msg["sources"]:
-            with st.expander(f"Retrieved Source References ({len(msg['sources'])})"):
-                for i, src in enumerate(msg["sources"], start=1):
-                    meta = src.get("metadata", {})
-                    p_id = meta.get("paper_id", "Unknown Document")
-                    p_num = meta.get("page_number", "N/A")
-                    st.markdown(f"**Reference {i}** &mdash; Filing: `{p_id}` | Page: `{p_num}`")
-                    st.markdown(f"> {src.get('text', '')}")
-                    if i < len(msg["sources"]):
-                        st.divider()
+            _render_sources(msg["sources"])
 
 
 # ─────────────────────────────────────────────
@@ -475,35 +465,32 @@ if generate_report_btn:
             )
         )
 
-        if report_charts:
-            render_chart(report_charts[0])
+        answer_ok = bool(report_answer) and bool(str(report_answer).strip())
+        if not answer_ok:
+            st.error("The model returned an empty response — please retry.")
+        else:
+            if report_charts:
+                render_chart(report_charts[0])
 
-        safe_label = doc_target_label.replace(" ", "_").replace("/", "-")
-        st.download_button(
-            label="Export Report (.md)",
-            data=report_answer,
-            file_name=f"FinSight_Report_{safe_label}.md",
-            mime="text/markdown",
-            key="btn_export_report",
-        )
+            safe_label = doc_target_label.replace(" ", "_").replace("/", "-")
+            st.download_button(
+                label="Export Report (.md)",
+                data=report_answer,
+                file_name=f"FinSight_Report_{safe_label}.md",
+                mime="text/markdown",
+                key="btn_export_report",
+            )
 
-        if report_sources:
-            with st.expander(f"Retrieved Source References ({len(report_sources)})"):
-                for i, src in enumerate(report_sources, start=1):
-                    meta = src.get("metadata", {})
-                    p_id = meta.get("paper_id", "Unknown Document")
-                    p_num = meta.get("page_number", "N/A")
-                    st.markdown(f"**Reference {i}** &mdash; Filing: `{p_id}` | Page: `{p_num}`")
-                    st.markdown(f"> {src.get('text', '')}")
-                    if i < len(report_sources):
-                        st.divider()
+            if report_sources:
+                _render_sources(report_sources)
 
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": report_answer,
-        "chart_data": report_charts[0] if report_charts else None,
-        "sources": report_sources,
-    })
+    if answer_ok:
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": report_answer,
+            "chart_data": report_charts[0] if report_charts else None,
+            "sources": report_sources,
+        })
 
 
 # ─────────────────────────────────────────────
@@ -593,15 +580,7 @@ if final_prompt:
             render_chart(chat_charts[0])
 
         if chat_sources:
-            with st.expander(f"Retrieved Source References ({len(chat_sources)})"):
-                for i, src in enumerate(chat_sources, start=1):
-                    meta = src.get("metadata", {})
-                    p_id = meta.get("paper_id", "Unknown Document")
-                    p_num = meta.get("page_number", "N/A")
-                    st.markdown(f"**Reference {i}** &mdash; Filing: `{p_id}` | Page: `{p_num}`")
-                    st.markdown(f"> {src.get('text', '')}")
-                    if i < len(chat_sources):
-                        st.divider()
+            _render_sources(chat_sources)
 
     st.session_state.messages.append({
         "role": "assistant",
