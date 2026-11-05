@@ -10,7 +10,7 @@ A Retrieval-Augmented Generation (RAG) assistant designed for retail investors t
   - **Dense Narrative Track**: Embeds unstructured text chunks via ChromaDB and `BAAI/bge-small-en-v1.5` embeddings for deep qualitative Q&A.
   - **Structured Ground-Truth Track**: Parses SEC XBRL instance documents directly with `lxml` into PostgreSQL across 69+ US-GAAP canonical metrics.
 - **High-Precision Q&A**: Zero-hallucination numeric retrieval backed by structured database facts combined with exact `[Page X]` and `[Source N]` text citations.
-- **Dynamic Evaluation Test Bench**: Evaluates both quantitative facts (against live PostgreSQL ground truth) and qualitative synthesis (LLM-as-a-Judge), achieving **95.7% pass rate** with **0.40% average numerical error**.
+- **Dynamic Evaluation Test Bench**: Evaluates both quantitative facts (against live PostgreSQL ground truth) and qualitative synthesis (LLM-as-a-Judge). Latest live run: **100% (23/23)** on AAPL FY2024 with **0.00% average numerical error** and 23/23 field-attributed checks.
 - **1-Click Standard Report**: Generate a 5-point retail investor financial summary.
 - **Automated CI**: GitHub Actions workflow verifies code quality and syntax on every push.
 
@@ -33,9 +33,14 @@ The system is continuously benchmarked using dynamic evaluation against audited 
 
 | Benchmark | Result | Description |
 |---|---|---|
-| **Quantitative Accuracy** | **95.7% (22/23 Passed)** | Tested against ground-truth facts extracted from SEC 10-K instance documents. |
-| **Avg Numerical Error** | **0.40%** | Average relative numerical variance on line items (R&D, CapEx, buybacks, taxes, etc.). |
+| **Quantitative Accuracy (live)** | **100% (23/23)** | AAPL FY2024 live run on 2026-11-05 under the attribution-aware checker. |
+| **Historical Re-score (FY2025)** | **95.7% (22/23)** | Re-scored 2026-11-05 with the same stricter checker; the one failure is a genuine wrong-value answer (R&D $31.37B vs. $34.55B). |
+| **Attribution Coverage** | **23/23 numeric cases** | Every numeric case exercised the field-aware check (no silent fallback to unordered number matching). |
+| **Avg Numerical Error** | **0.00% live / 0.0015% historical** | Relative error over answers that produced an attributed number. |
+| **Adversarial False Positives** | **0/15** | Wrong-field, wrong-period, and right-number/wrong-line-item answers are all rejected. |
 | **Numeric Hallucination** | **0.0%** | Zero hallucinations on mapped XBRL line items via direct PostgreSQL fact injection. |
+
+The live benchmark covers AAPL FY2024 (23 metrics) because the current database carries FY2022–FY2024 filings. Numbers are produced by `eval/run_eval.py --mode quantitative`; the adversarial results come from `eval/test_checker_attribution.py`.
 
 ---
 

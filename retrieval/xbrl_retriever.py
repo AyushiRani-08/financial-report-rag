@@ -64,6 +64,33 @@ class XBRLRetriever:
         # Initialize a thread‑safe connection pool (min 1, max 5 connections)
         self._pool = psycopg2.pool.ThreadedConnectionPool(1, 5, dsn=self.dsn)
         self._conn: Optional[psycopg2.extensions.connection] = None
+        self._columns: Optional[set[str]] = None
+
+    def _table_columns(self, conn) -> set[str]:
+        """
+        Columns actually present on financial_facts.
+
+        Deployments drift from db/schema.sql: this database lacks both
+        duration_days and is_instant. Selecting a missing column aborted the
+        query, and the caller only logged a warning — every structured fact
+        silently vanished from the prompt.
+        """
+        if self._columns is None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = 'financial_facts'
+                    """
+                )
+                self._columns = {row[0] for row in cur.fetchall()}
+        return self._columns
+
+    def _column_expr(self, conn, column: str, cast: str) -> str:
+        """`ff.<column>` when it exists, otherwise a typed NULL alias."""
+        if column in self._table_columns(conn):
+            return f"ff.{column}"
+        return f"NULL::{cast} AS {column}"
 
     @property
     def conn(self) -> psycopg2.extensions.connection:
@@ -114,32 +141,40 @@ class XBRLRetriever:
             period_filter = "AND fi.fiscal_period = %s"
             params.append(fiscal_period)
 
-        query = f"""
-            SELECT
-                ff.canonical_field,
-                ff.value,
-                ff.unit,
-                ff.period_start,
-                ff.period_end,
-                ff.duration_days,
-                ff.is_instant,
-                fi.form_type,
-                fi.fiscal_period,
-                ff.tag
-            FROM financial_facts ff
-            JOIN filings fi ON fi.filing_id = ff.filing_id
-            JOIN companies c  ON c.company_id = fi.company_id
-            WHERE c.ticker = %s
-              AND ff.canonical_field = ANY(%s)
-              AND ff.value IS NOT NULL
-              {period_filter}
-            ORDER BY ff.period_end DESC NULLS LAST,
-                     ff.duration_days DESC NULLS LAST,
-                     ff.fact_id DESC
-        """
-
         conn = self.conn
         try:
+            duration_select = self._column_expr(conn, "duration_days", "int")
+            is_instant_select = self._column_expr(conn, "is_instant", "boolean")
+            duration_order = (
+                "ff.duration_days DESC NULLS LAST,"
+                if "duration_days" in self._table_columns(conn)
+                else ""
+            )
+
+            query = f"""
+                SELECT
+                    ff.canonical_field,
+                    ff.value,
+                    ff.unit,
+                    ff.period_start,
+                    ff.period_end,
+                    {duration_select},
+                    {is_instant_select},
+                    fi.form_type,
+                    fi.fiscal_period,
+                    ff.tag
+                FROM financial_facts ff
+                JOIN filings fi ON fi.filing_id = ff.filing_id
+                JOIN companies c  ON c.company_id = fi.company_id
+                WHERE c.ticker = %s
+                  AND ff.canonical_field = ANY(%s)
+                  AND ff.value IS NOT NULL
+                  {period_filter}
+                ORDER BY ff.period_end DESC NULLS LAST,
+                         {duration_order}
+                         ff.fact_id DESC
+            """
+
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(query, params)
                 return [dict(row) for row in cur.fetchall()]

@@ -53,6 +53,7 @@ from groq import Groq
 from generation.generator import RAGGenerator
 from indexing.vector_store import VectorStore
 from retrieval.retriever import Retriever
+from eval.check_numerical_v2 import check_numerical_attributed as _attributed_check
 
 load_dotenv()
 
@@ -223,11 +224,12 @@ def judge_groundedness(
             else:
                 print(f"      [JUDGE WARN] {exc}")
 
-    # Fallback if judge fails
+    # Fallback if judge fails — ungraded, never fabricated defaults.
     return {
-        "groundedness_score": 3, "faithfulness_score": 3, "relevance_score": 3,
-        "has_hallucination": False, "correctly_abstained": abstention_expected,
-        "judge_reasoning": "Judge unavailable — default scores assigned",
+        "groundedness_score": None, "faithfulness_score": None, "relevance_score": None,
+        "has_hallucination": None, "correctly_abstained": abstention_expected,
+        "judge_reasoning": "Judge unavailable — ungraded",
+        "judge_used_fallback": True,
     }
 
 
@@ -258,6 +260,7 @@ def score_question(
     tol  = case.get("tolerance_pct", 2.0)
     abstention_expected = case.get("abstention_expected", False)
     actually_abstained  = check_abstention(answer)
+    judge_fallback      = judge_scores.get("judge_used_fallback", False)
 
     result: Dict[str, Any] = {
         "retrieval_accuracy":    None,
@@ -276,7 +279,7 @@ def score_question(
             sum(s.get("similarity_score", 0) for s in sources) / len(sources)
             if sources else 0
         )
-        judge_relevant = (judge_scores.get("relevance_score") or 0) >= 3
+        judge_relevant = judge_fallback or (judge_scores.get("relevance_score") or 0) >= 3
         # For abstention-expected, retrieval can still pass if sources were found
         result["retrieval_accuracy"] = (
             has_sources and avg_sim >= 0.3 and (judge_relevant or abstention_expected)
@@ -285,7 +288,13 @@ def score_question(
     # ── 2. NUMERICAL ACCURACY ─────────────────────────────────────────────
     # Only scored when ground_truth_value is a number
     if "numerical_accuracy" in dims and gt is not None and isinstance(gt, (int, float)):
-        num_check = check_numerical(answer, float(gt), tol or 2.0)
+        num_check = _attributed_check(
+            model_answer=answer,
+            ground_truth=float(gt),
+            canonical_field=case.get("canonical_field", ""),
+            expected_period=case.get("fiscal_period"),
+            tolerance=(tol or 2.0) / 100,
+        )
         result["numerical_accuracy"] = num_check["passed"]
         result["_num_check"] = num_check          # store for reporting
 
@@ -294,19 +303,31 @@ def score_question(
     # Uses the same numeric check but flags it as a calculation result.
     if "calculation_accuracy" in dims and gt is not None and isinstance(gt, (int, float)):
         if "_num_check" not in result:
-            num_check = check_numerical(answer, float(gt), tol or 5.0)
+            num_check = _attributed_check(
+                model_answer=answer,
+                ground_truth=float(gt),
+                canonical_field=case.get("canonical_field", ""),
+                expected_period=case.get("fiscal_period"),
+                tolerance=(tol or 5.0) / 100,
+            )
             result["_num_check"] = num_check
         result["calculation_accuracy"] = result["_num_check"]["passed"]
     elif "calculation_accuracy" in dims:
-        # For qualitative calculations: judge's faithfulness >= 3 is the proxy
-        result["calculation_accuracy"] = (judge_scores.get("faithfulness_score") or 0) >= 3
+        # For qualitative calculations: judge's faithfulness >= 3 is the proxy.
+        # Only count if judge actually scored (not fallback default).
+        judge_fallback = judge_scores.get("judge_used_fallback", False)
+        faith = judge_scores.get("faithfulness_score") or 0
+        result["calculation_accuracy"] = (not judge_fallback) and faith >= 3
 
     # ── 4. GROUNDEDNESS ACCURACY ──────────────────────────────────────────
     # Passes when groundedness_score >= 4 AND no hallucination detected
     if "groundedness_accuracy" in dims:
-        gs = judge_scores.get("groundedness_score") or 0
-        no_halluc = not judge_scores.get("has_hallucination", True)
-        result["groundedness_accuracy"] = gs >= 4 and no_halluc
+        if judge_fallback:
+            result["groundedness_accuracy"] = None  # ungraded, not failed
+        else:
+            gs = judge_scores.get("groundedness_score") or 0
+            no_halluc = not judge_scores.get("has_hallucination", True)
+            result["groundedness_accuracy"] = gs >= 4 and no_halluc
 
     # ── 5. ABSTENTION ACCURACY ────────────────────────────────────────────
     # PASS scenarios:
@@ -377,6 +398,34 @@ def run_eval(
 
         latency_ms = round((time.perf_counter() - t0) * 1000)
         time.sleep(1.5)  # Groq rate-limit pacing
+
+        # ── Guard: skip judge + scoring if retrieval returned nothing ──────
+        if not answer.strip():
+            print(f"      [SKIP] Empty answer — no chunks retrieved. Marking all dims as None.")
+            result = {
+                "id": q_id, "category": category,
+                "sub_category": case.get("sub_category", ""),
+                "ticker": ticker, "fiscal_period": period, "question": question,
+                "abstention_expected": case.get("abstention_expected", False),
+                "ground_truth_value": case.get("ground_truth_value"),
+                "ground_truth_unit": case.get("ground_truth_unit"),
+                "ground_truth_formatted": case.get("ground_truth_formatted"),
+                "tolerance_pct": case.get("tolerance_pct"),
+                "model_answer": "", "sources_returned": 0, "avg_similarity": 0.0,
+                "latency_ms": latency_ms,
+                "best_match": None, "relative_error_pct": None, "extracted_values": [],
+                "groundedness_score": None, "faithfulness_score": None,
+                "relevance_score": None, "has_hallucination": None,
+                "correctly_abstained": None, "judge_reasoning": "SKIPPED — empty answer",
+                "retrieval_accuracy": False,  # definitively failed retrieval
+                "numerical_accuracy": None, "calculation_accuracy": None,
+                "groundedness_accuracy": None, "abstention_accuracy": None,
+                "overall_pass": False,
+                "eval_dimensions": case.get("eval_dimensions", []),
+                "empty_answer": True,
+            }
+            results.append(result)
+            continue
 
         # LLM-as-Judge
         judge = judge_groundedness(
@@ -542,6 +591,9 @@ def compute_summary(results: List[Dict]) -> Dict:
         "max_ms":  max(lats) if lats else 0,
     }
 
+    # 7. Empty-answer count (retrieval failure indicator)
+    summary["empty_answers"] = sum(1 for r in results if r.get("empty_answer"))
+
     return summary
 
 
@@ -578,6 +630,9 @@ def print_summary(summary: Dict) -> None:
     print(f"  False abstentions (over-refusal): {abst['false_abstentions']}")
     halluc = summary["hallucination"]
     print(f"  Hallucinations detected      : {halluc['detected_count']} / {halluc['total_judged']}")
+    empty = summary.get("empty_answers", 0)
+    if empty:
+        print(f"  ⚠  Empty answers (no retrieval): {empty} / {summary['total_cases']} — re-ingest docs")
 
     lat = summary["latency"]
     print(f"\n{'─'*W}")

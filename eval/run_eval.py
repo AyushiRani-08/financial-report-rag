@@ -42,6 +42,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from generation.generator import RAGGenerator
 from indexing.vector_store import VectorStore
 from utils.periods import expected_duration_days
+from eval.check_numerical_v2 import check_numerical_attributed as _check_numerical_attributed
 
 load_dotenv()
 
@@ -154,6 +155,19 @@ QUANT_TEMPLATES = {
 }
 
 
+def _has_duration_column(conn) -> bool:
+    """True when the deployed schema has financial_facts.duration_days."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'financial_facts' AND column_name = 'duration_days'
+            LIMIT 1
+            """
+        )
+        return cur.fetchone() is not None
+
+
 def fetch_quant_ground_truths(conn, ticker_filter=None, period_filter=None) -> list[dict]:
     """Query PostgreSQL for deduplicated ground-truth facts."""
     where_clauses = ["ff.canonical_field = ANY(%s)", "ff.value IS NOT NULL", "ff.period_end IS NOT NULL"]
@@ -166,13 +180,16 @@ def fetch_quant_ground_truths(conn, ticker_filter=None, period_filter=None) -> l
         where_clauses.append("fi.fiscal_period = %s")
         params.append(period_filter)
 
+    duration_expr = (
+        "ff.duration_days" if _has_duration_column(conn) else "NULL::int AS duration_days"
+    )
     query = f"""
         SELECT
             c.ticker, c.name AS company_name, fi.fiscal_period,
             ff.canonical_field,
             ff.value,
             ff.unit,
-            ff.duration_days,
+            {duration_expr},
             ff.period_start, ff.period_end
         FROM financial_facts ff
         JOIN filings fi   ON fi.filing_id  = ff.filing_id
@@ -234,7 +251,12 @@ def run_quantitative_eval(generator: RAGGenerator, conn, ticker_filter=None, per
             time.sleep(1.0)  # Pacing to respect API rate limits
             answer = response.get("answer", "")
             latency_ms = round((time.perf_counter() - t_start) * 1000)
-            num_check = check_numerical(answer, gt_value)
+            num_check = _check_numerical_attributed(
+                model_answer=answer,
+                ground_truth=gt_value,
+                canonical_field=field,
+                expected_period=period,
+            )
 
             result = {
                 "mode": "quantitative",
@@ -249,9 +271,11 @@ def run_quantitative_eval(generator: RAGGenerator, conn, ticker_filter=None, per
                 "best_match": num_check["best_match"],
                 "relative_error_pct": num_check["relative_error_pct"],
                 "tolerance_pct": num_check["tolerance_pct"],
+                "attribution_checked": num_check.get("attribution_checked", False),
+                "attribution_match": num_check.get("attribution_match"),
                 "latency_ms": latency_ms,
                 "sources_returned": len(response.get("sources", [])),
-                "error": None,
+                "error": None if answer.strip() else "empty_model_answer",
             }
         except Exception as e:
             result = {
@@ -261,7 +285,7 @@ def run_quantitative_eval(generator: RAGGenerator, conn, ticker_filter=None, per
                 "passed": False, "error": str(e),
             }
 
-        status = "PASS" if result.get("passed") else "FAIL"
+        status = "ERROR" if result.get("error") else ("PASS" if result.get("passed") else "FAIL")
         err_pct = result.get("relative_error_pct")
         err_str = f"err={err_pct:.1f}%" if err_pct is not None else "no match"
         print(f"     -> {status} ({err_str})")
@@ -374,7 +398,7 @@ def generate_qualitative_questions(groq_client: Groq, vector_store: VectorStore,
 def judge_answer(groq_client: Groq, question: str, answer: str, sources: list) -> dict:
     """Use Groq LLM to judge answer faithfulness, relevance, and clarity."""
     context_text = "\n---\n".join([
-        f"[Source {i+1} | Page {s.get('metadata', {}).get('page_number', '?')}]\n{s.get('text', '')[:400]}"
+        f"[Source {i+1} | Page {s.get('metadata', {}).get('page_number', '?')}]\n{s.get('text', '')}"
         for i, s in enumerate(sources[:4])
     ])
     if not context_text:
@@ -394,12 +418,15 @@ def judge_answer(groq_client: Groq, question: str, answer: str, sources: list) -
             raw = response.choices[0].message.content.strip()
             match = re.search(r'\{.*?\}', raw, re.DOTALL)
             if match:
-                return json.loads(match.group(0))
+                scores = json.loads(match.group(0))
+                scores.setdefault("judge_used_fallback", False)
+                return scores
         except Exception:
             if attempt < 2:
                 time.sleep(3.0 * (attempt + 1))
-    return {"faithfulness": 4, "relevance": 4, "retail_clarity": 4,
-            "has_hallucination": False, "reasoning": "Evaluated based on retrieved citations"}
+    return {"faithfulness": None, "relevance": None, "retail_clarity": None,
+            "has_hallucination": None, "reasoning": "Judge unavailable — ungraded",
+            "judge_used_fallback": True}
 
 
 def run_qualitative_eval(generator: RAGGenerator, vector_store: VectorStore,
@@ -435,6 +462,8 @@ def run_qualitative_eval(generator: RAGGenerator, vector_store: VectorStore,
             sources   = response.get("sources", [])
             latency_ms = round((time.perf_counter() - t_start) * 1000)
             scores    = judge_answer(groq_client, question, answer, sources)
+            empty     = not (answer or "").strip()
+            graded    = not scores.get("judge_used_fallback", False) and not empty
 
             result = {
                 "mode": "qualitative",
@@ -448,12 +477,13 @@ def run_qualitative_eval(generator: RAGGenerator, vector_store: VectorStore,
                 "judge_reasoning": scores.get("reasoning"),
                 "latency_ms": latency_ms,
                 "sources_returned": len(sources),
+                "graded": graded,
                 "passed": (
-                    scores.get("faithfulness") is not None and
-                    scores.get("faithfulness") >= 3 and
+                    graded and
+                    (scores.get("faithfulness") or 0) >= 3 and
                     scores.get("has_hallucination") is False
                 ),
-                "error": None,
+                "error": "empty_model_answer" if empty else None,
             }
         except Exception as e:
             result = {
@@ -462,7 +492,12 @@ def run_qualitative_eval(generator: RAGGenerator, vector_store: VectorStore,
             }
 
         faith = result.get("faithfulness", "?")
-        status = "PASS" if result.get("passed") else "FAIL"
+        if result.get("error"):
+            status = "ERROR"
+        elif not result.get("graded", True):
+            status = "UNGRADED"
+        else:
+            status = "PASS" if result.get("passed") else "FAIL"
         print(f"     -> {status} (faithfulness={faith}/5)")
         results.append(result)
 
@@ -484,38 +519,51 @@ def print_summary(all_results: list[dict], save_path: Path):
     print("="*60)
 
     if quant:
-        q_pass = pct(quant)
-        avg_err = [r["relative_error_pct"] for r in quant if r.get("relative_error_pct") is not None]
+        graded_q = [r for r in quant if not r.get("error")]
+        q_errors = len(quant) - len(graded_q)
+        q_pass = pct(graded_q)
+        avg_err = [r["relative_error_pct"] for r in graded_q if r.get("relative_error_pct") is not None]
         avg_err_str = f"{sum(avg_err)/len(avg_err):.2f}%" if avg_err else "N/A"
-        avg_lat = [r["latency_ms"] for r in quant if r.get("latency_ms")]
-        print(f"\n  Quantitative ({len(quant)} cases)")
-        print(f"    Pass Rate:        {q_pass}%")
+        avg_lat = [r["latency_ms"] for r in graded_q if r.get("latency_ms")]
+        attr_checked = sum(1 for r in graded_q if r.get("attribution_checked"))
+        print(f"\n  Quantitative ({len(graded_q)} graded / {len(quant)} cases)")
+        print(f"    Pass Rate:        {q_pass}%  (attributed checker)")
+        print(f"    Errors:           {q_errors} (ungraded)")
         print(f"    Avg Num Error:    {avg_err_str}")
         print(f"    Avg Latency:      {round(sum(avg_lat)/len(avg_lat))}ms" if avg_lat else "")
+        print(f"    Attribution coverage: {attr_checked}/{len(graded_q)} graded cases used field-aware check")
         # Breakdown by ticker
-        tickers = sorted({r["ticker"] for r in quant if r.get("ticker")})
+        tickers = sorted({r["ticker"] for r in graded_q if r.get("ticker")})
         for t in tickers:
-            t_res = [r for r in quant if r.get("ticker") == t]
+            t_res = [r for r in graded_q if r.get("ticker") == t]
             print(f"    {t}: {pct(t_res)}% ({sum(1 for r in t_res if r.get('passed'))}/{len(t_res)} passed)")
 
     if qual:
-        faith_scores = [r["faithfulness"] for r in qual if r.get("faithfulness") is not None]
-        rel_scores   = [r["relevance"] for r in qual if r.get("relevance") is not None]
-        halluc_rate  = sum(1 for r in qual if r.get("has_hallucination") is True)
-        print(f"\n  Qualitative ({len(qual)} cases)")
-        print(f"    Pass Rate:        {pct(qual)}%")
+        graded      = [r for r in qual if r.get("graded", True) and not r.get("error")]
+        ungraded    = len(qual) - len(graded)
+        faith_scores = [r["faithfulness"] for r in graded if r.get("faithfulness") is not None]
+        rel_scores   = [r["relevance"] for r in graded if r.get("relevance") is not None]
+        halluc_rate  = sum(1 for r in graded if r.get("has_hallucination") is True)
+        print(f"\n  Qualitative ({len(graded)} graded / {len(qual)} cases)")
+        print(f"    Pass Rate:        {pct(graded)}%")
         print(f"    Avg Faithfulness: {sum(faith_scores)/len(faith_scores):.2f}/5" if faith_scores else "")
         print(f"    Avg Relevance:    {sum(rel_scores)/len(rel_scores):.2f}/5" if rel_scores else "")
-        print(f"    Hallucinations:   {halluc_rate}/{len(qual)}")
+        print(f"    Hallucinations:   {halluc_rate}/{len(graded)}")
+        if ungraded:
+            print(f"    Ungraded:         {ungraded} (judge unavailable / empty answer)")
 
     # Save results
     output = {
         "run_timestamp": datetime.now().isoformat(),
         "summary": {
             "quantitative_cases": len(quant),
-            "quantitative_pass_rate": pct(quant),
+            "quantitative_graded_cases": sum(1 for r in quant if not r.get("error")),
+            "quantitative_pass_rate": pct([r for r in quant if not r.get("error")]),
+            "quantitative_errors": sum(1 for r in quant if r.get("error")),
             "qualitative_cases": len(qual),
-            "qualitative_pass_rate": pct(qual),
+            "qualitative_graded_cases": sum(1 for r in qual if r.get("graded", True) and not r.get("error")),
+            "qualitative_ungraded_cases": sum(1 for r in qual if not r.get("graded", True) or r.get("error")),
+            "qualitative_pass_rate": pct([r for r in qual if r.get("graded", True) and not r.get("error")]),
         },
         "results": all_results,
     }

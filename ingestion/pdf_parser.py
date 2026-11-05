@@ -149,7 +149,12 @@ def _page_tables(page) -> List[Tuple[BBox, List[List[str]]]]:
             bbox = tuple(float(v) for v in table.bbox)
         except Exception:
             continue
-        entries.append((bbox, cleaned))
+        try:
+            names = getattr(getattr(table, "header", None), "names", None) or []
+            header_hint = [str(n or "") for n in names]
+        except Exception:
+            header_hint = []
+        entries.append((bbox, cleaned, header_hint))
     return entries
 
 
@@ -233,11 +238,14 @@ def extract_pdf_blocks(
                         "text": ocr_text,
                     }]
 
-            table_bboxes = [bbox for bbox, _ in tables]
+            table_bboxes = [bbox for bbox, _, _ in tables]
 
             items: List[Dict[str, Any]] = []
-            for bbox, grid in tables:
-                items.append({"y": bbox[1], "x": bbox[0], "kind": "table", "bbox": bbox, "grid": grid})
+            for bbox, grid, header_hint in tables:
+                items.append({
+                    "y": bbox[1], "x": bbox[0], "kind": "table", "bbox": bbox,
+                    "grid": grid, "header_hint": header_hint,
+                })
             for tb in text_blocks:
                 if any(_belongs_to_table(tb["bbox"], table_bbox) for table_bbox in table_bboxes):
                     continue
@@ -263,6 +271,7 @@ def extract_pdf_blocks(
                         section=current_section,
                         page_start=page_no,
                         page_end=page_no,
+                        header_hint=item.get("header_hint"),
                     )
                     if table_block is None:
                         continue

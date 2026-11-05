@@ -100,10 +100,19 @@ class Retriever:
             relaxed = {**scope_args, "statement_scope": None}
             chunks = self.vector_store.query(top_k=top_k, is_table=is_table, **relaxed)
 
-        if not chunks and scope_args.get("fiscal_period") and scope_args.get("ticker") \
-                and not scope_args.get("paper_id"):
+        # `fiscal_period` often comes from a year named in the question ("revenue
+        # in 2023"), not from the filing. Session uploads carry no period metadata,
+        # so keeping that filter dead-ends even when the document is attached.
+        # Relax the period, never the document or the company.
+        if not chunks and scope_args.get("fiscal_period"):
             relaxed = {**scope_args, "fiscal_period": None, "statement_scope": None}
             chunks = self.vector_store.query(top_k=top_k, is_table=is_table, **relaxed)
+
+        # Chunks ingested before the is_table flag existed have no such key, and
+        # filtering on a missing key matches nothing. Retry unfiltered so a
+        # numeric question still reaches text chunks instead of dead-ending.
+        if not chunks and is_table is not None:
+            chunks = self.vector_store.query(top_k=top_k, is_table=None, **scope_args)
 
         return chunks
 

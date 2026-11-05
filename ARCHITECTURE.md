@@ -196,7 +196,9 @@ filings
 
 financial_facts
   └─ fact_id, filing_id, tag, canonical_field, value, unit,
-     period_start, period_end, source_page
+     period_start, period_end, source_page,
+     duration_days*, is_instant*      (*optional — readers degrade gracefully
+                                         when the deployed schema omits them)
 ```
 
 `canonical_field` normalises ~25 raw US-GAAP tag variants (e.g. `Revenues`, `RevenueFromContractWithCustomer...`, `SalesRevenueNet`) all into `"revenue"`. See `CANONICAL_MAP` in `ingestion/xbrl_parser.py`.
@@ -224,16 +226,22 @@ Two databases serve different purposes:
 ### Quantitative Mode
 - Pulls ground-truth values directly from PostgreSQL (`financial_facts`)
 - Auto-generates questions from `QUANT_TEMPLATES` (e.g. *"What was AAPL's revenue for FY2025?"*)
-- Checks RAG answer numerically within ±2% tolerance
-- Reports pass rate, avg numerical error, latency per ticker
+- Checks answers with the **attribution-aware** checker (`eval/check_numerical_v2.py`): a number only passes when it is within ±2% of ground truth, sits nearest to an alias of the expected `canonical_field`, and is not attached to a contradicting fiscal year. Field resolution also covers derived names (`revenue_yoy_growth`, `eps_diluted_cross_check`, …) and ratio fields.
+- Cases that raise an exception (empty answer, API failure) are reported as **ERROR / ungraded** and excluded from the pass-rate denominator — they are never silently scored as failures or passes.
+- Reports pass rate, avg numerical error, latency per ticker, and attribution coverage (how many graded cases actually exercised the field-aware path)
+- Tolerates schemas without the optional `duration_days` / `is_instant` columns (they are read only when present)
 
 ### Qualitative Mode (LLM-as-Judge)
 - Samples 3 chunks from each indexed document
 - Uses Groq to generate 2 qualitative questions per document
 - Scores answers on: **faithfulness** (1–5), **relevance** (1–5), **retail_clarity** (1–5), **has_hallucination** (bool)
-- Pass condition: faithfulness ≥ 3 AND has_hallucination = false
+- The judge sees the **full** retrieved chunk text (no character truncation)
+- Judge failure marks the case **ungraded** (`None` scores, `judge_used_fallback: true`) instead of inventing default 3/5 scores; the summary pass rate is computed over graded cases only
+- Pass condition: faithfulness ≥ 3 AND has_hallucination = false AND the case was actually graded
 
 Results saved to `eval/results/eval_YYYYMMDD_HHMMSS.json`.
+
+**Why a custom harness instead of RAGAS or TruLens?** RAGAS and TruLens score text against text (faithfulness, context precision/recall, answer relevancy). They cannot verify an audited dollar figure against the XBRL fact it came from, so they would grade the numeric half of this system — the half where hallucinations matter most — by proxy. RAGAS is an offline benchmark and TruLens is instrumentation/observability; both remain useful for the narrative track, but neither replaces the deterministic numeric checker.
 
 ---
 
@@ -301,6 +309,8 @@ Final: **bge-small wins 5-0** (though 3 are score-calibration ties, not genuine 
 | **Deterministic Metric Coverage** | 8 metrics | **23 metrics (69 US-GAAP tags)** | **+187.5% coverage expansion** |
 | **Hallucination on Mapped Line Items** | Variable (reliant on table parsing) | **0.0% error** | **100% deterministic grounding** |
 
+*Re-scored 2026-11-05 with the attribution-aware checker: **22/23 (95.7%)**, average error **0.001%** over the 22 answers with an attributed match. The single failure (FY2025 R&D expense reported as $31.37B vs. the audited $34.55B) is a genuine wrong-value answer, not a checker artifact.*
+
 #### 2. How Accuracy Was Increased (The Technical Mechanism):
 
 1. **Eliminated Semantic Ambiguity on Numbers**:
@@ -326,6 +336,48 @@ Final: **bge-small wins 5-0** (though 3 are score-calibration ties, not genuine 
    - The LLM cites these audited numbers directly without doing optical or tabular guesswork, achieving **0.0% error** on all mapped line items.
 
 **Decision**: ✅ Adopted as core architecture. Grounding numbers in relational XBRL facts while reserving dense vector search for narrative analysis achieves both zero numerical hallucination and qualitative depth.
+
+---
+
+### Experiment 4 — Evaluation Hardening (November 2026)
+**Hypothesis**: The published 95.7% was measured by a checker that passed any number within ±2% of ground truth, regardless of which line item or fiscal year it belonged to. Measure honestly before trusting the number.
+
+#### What was wrong
+
+1. **Field attribution**: `Cost of revenue was $391B` passed a revenue question, because the checker only compared numbers.
+2. **Period attribution**: `FY2023 revenue was $391B` passed an FY2024 question; the period branch was a no-op.
+3. **Fail-open judge**: Groq judge errors returned default 4/5 scores, and the judge context was truncated at 400 characters.
+4. **Empty answers** were scored as ordinary failures instead of ungraded cases, biasing the denominator.
+5. **Numeric retrieval dead-ended**: all 854 chunks lacked the `is_table` metadata key, and ChromaDB filtering on a missing key matches nothing.
+6. **Schema drift**: the deployed `financial_facts` lacked `duration_days` and `is_instant`, so the XBRL retriever raised `UndefinedColumn` and the structured block silently disappeared.
+7. **Alias coverage**: derived and ratio fields (e.g. `revenue_yoy_growth`) fell back to unattributed matching.
+
+#### What changed
+
+| Area | Change |
+|---|---|
+| `eval/check_numerical_v2.py` | Nearest-alias attribution, nearest-period logic, Unicode/typographic folding, derived-field resolution, ratio aliases, tighter number parsing |
+| `eval/run_eval.py` | Attributed check wired in with `canonical_field` + `fiscal_period`; schema guards; full judge context; ungraded states; summary over graded cases |
+| `eval/run_eval_50.py` | Same five-dimension scoring rules; empty-answer and judge-fallback cases left ungraded |
+| `retrieval/retriever.py`, `scripts/backfill_is_table.py` | `is_table` backfill plus a text fallback when the table branch is empty |
+| `retrieval/xbrl_retriever.py` | Column introspection; selects only columns that exist |
+
+#### Measured effect
+
+| Metric | Before | After |
+|---|---|---|
+| Adversarial answers accepted (15) | **15/15** | **0/15** |
+| False positives on 20 hand-labelled answers | 4 | **0** |
+| False negatives on those answers | 0 | **0** |
+| Numeric fields using the field-aware check | partial | **23/23 DB fields, 33/33 golden numeric cases** |
+| Historical FY2025 re-score (23 cases) | 95.7% (unattributed) | **95.7% (attributed)** |
+| Live AAPL FY2024 run (23 cases) | — | **100% (23/23), 0.00% avg error, 23/23 attributed** |
+
+The four PASS→FAIL flips are genuine model errors: OCF answered with net income ($118.25B), total assets answered with total liabilities ($364.98B), capex answered with dividends ($9.45B), and R&D answered with SG&A ($31.37B).
+
+The live run also surfaced a false negative the static suite missed: a correct operating-cash-flow answer using the phrase "net cash generated by operating activities" was rejected until that alias variant was added. Alias vocabulary is therefore still a living part of the checker, not a closed list.
+
+**Decision**: ✅ Adopted. The harness now fails closed: ungraded is distinct from failed, numbers must be attributed to the right field and period, and infrastructure gaps that produced empty retrieval are repaired.
 
 ---
 

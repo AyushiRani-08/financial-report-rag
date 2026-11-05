@@ -44,6 +44,30 @@ MONEY_CELL_REGEX = re.compile(
 )
 ALPHA_REGEX = re.compile(r"[A-Za-z]")
 
+# A header cell naming a reporting period: 31.03.2026, 31-Mar-26, March 31, 2026.
+_DATE_PATTERN = (
+    r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}"
+    r"|\d{1,2}-[A-Za-z]{3,9}-\d{2,4}"
+    r"|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}"
+    r"|\d{1,2}\s+[A-Za-z]{3,9},?\s+\d{4}"
+    r"|\d{4}\s*[-–/]\s*\d{2,4}"
+)
+DATE_CELL_REGEX = re.compile(rf"^\s*(?:{_DATE_PATTERN})\s*$")
+_DATE_TOKEN_REGEX = re.compile(rf"^(?:{_DATE_PATTERN})")
+YEAR_CELL_REGEX = re.compile(r"^\s*(?:19|20)\d{2}\s*$")
+
+# Numbers inside a cell; several of them mean the layout merged a whole row in.
+_AMOUNT_TOKEN_REGEX = re.compile(
+    r"\d{1,3}(?:,\d{3})+\.\d{2}|\d+\.\d{2}|(?<![\d.])\d{3,}(?![\d.])"
+)
+
+
+def _row_looks_like_body_text(cells: List[str]) -> bool:
+    """Detects a data row whose label or amounts the layout squashed into one cell."""
+    if cells and len(cells[0]) > 80:
+        return True
+    return any(len(_AMOUNT_TOKEN_REGEX.findall(c)) >= 2 for c in cells)
+
 
 @dataclass
 class TableBlock:
@@ -136,13 +160,105 @@ def is_footnote_text(text: str) -> bool:
 
 
 def _row_is_header(row: List[str]) -> bool:
-    """A header row has words and no reported amounts."""
+    """A header row names columns — words, dates or years — never reported amounts."""
     cells = [c for c in row if c]
     if not cells:
         return False
-    has_alpha = any(ALPHA_REGEX.search(c) for c in cells)
-    has_money = any(MONEY_CELL_REGEX.match(c) for c in cells)
-    return has_alpha and not has_money
+    if any(MONEY_CELL_REGEX.match(c) for c in cells):
+        return False
+    # Date-led rows are headers even when the layout packed data into a cell
+    # beside them; a packed row with no date is body text.
+    has_date = any(DATE_CELL_REGEX.match(c) for c in cells)
+    if not has_date and _row_looks_like_body_text(cells):
+        return False
+    if any(ALPHA_REGEX.search(c) for c in cells):
+        return True
+    if has_date:
+        return True
+    return sum(1 for c in cells if YEAR_CELL_REGEX.match(c)) >= 2
+
+
+def _first_date_token(text: str) -> str:
+    """Leading period token of a cell, ignoring amounts packed in behind it."""
+    match = _DATE_TOKEN_REGEX.match((text or "").strip())
+    return match.group(0).strip() if match else ""
+
+
+def _expand_header_hint(names: Optional[List[str]], width: int) -> List[str]:
+    """
+    Spreads a detected header across merged cells.
+
+    find_tables() cuts spanning header cells at column boundaries, so
+    "Standalone" arrives as ["Stand", "dalone"]. Consecutive fragments that
+    continue mid-word are rejoined and applied to every column they span.
+    Returns [] when the fragments carry no words at all.
+    """
+    if not names or width <= 0:
+        return []
+    cells = [clean_cell_text(n) for n in names][:width]
+    cells += [""] * (width - len(cells))
+
+    labels = [""] * width
+    i = 0
+    while i < width:
+        text = cells[i]
+        if not text:
+            i += 1
+            continue
+        j = i
+        while j + 1 < width and cells[j + 1] and cells[j + 1][0].islower():
+            fragment = cells[j + 1]
+            # The column cut often leaves the boundary letter on both sides.
+            if text and text[-1].lower() == fragment[0].lower():
+                fragment = fragment[1:]
+            text += fragment
+            j += 1
+        for k in range(i, j + 1):
+            labels[k] = text
+        i = j + 1
+
+    return labels if any(ALPHA_REGEX.search(l) for l in labels if l) else []
+
+
+def _headers_are_placeholders(headers: List[str]) -> bool:
+    real = [h for h in headers if h and not h.lower().startswith("col_")]
+    return not any(ALPHA_REGEX.search(h) for h in real)
+
+
+def _first_column_is_text(rows: List[List[str]]) -> bool:
+    """True when the leftmost column holds row labels rather than amounts."""
+    cells = [clean_cell_text(r[0]) for r in rows if r and clean_cell_text(r[0])]
+    if not cells:
+        return False
+    return sum(1 for c in cells if ALPHA_REGEX.search(c)) / len(cells) >= 0.6
+
+
+def _repair_first_label(label: str, caption: str) -> str:
+    """Restores a first-column label cut short by the table's left edge."""
+    if not label or not label[0].islower() or not caption:
+        return label
+    first = caption.split()[0].strip("()[],.:;")
+    if len(first) > len(label) and first.lower().endswith(label.lower()):
+        return first
+    return label
+
+
+def _combine_header_tiers(parents: List[str], children: List[str]) -> List[str]:
+    """Merges a parent header tier with the date tier beneath it."""
+    combined: List[str] = []
+    for i in range(max(len(parents), len(children))):
+        parent = parents[i] if i < len(parents) else ""
+        child = children[i] if i < len(children) else ""
+        token = _first_date_token(child)
+        if token:
+            child = token
+        elif child.lower().startswith("col_"):
+            child = ""
+        if parent and child and child not in parent:
+            combined.append(f"{parent} - {child}")
+        else:
+            combined.append(parent or child)
+    return combined
 
 
 def count_amount_rows(grid: List[List[str]]) -> int:
@@ -163,6 +279,9 @@ def looks_like_financial_table(grid: List[List[str]], min_amount_rows: int = 2) 
     if len(rows) < 2:
         return False
     if max(len(row) for row in rows) < 2:
+        return False
+    # Grids with no words at all are charts or figures, not statements.
+    if not any(ALPHA_REGEX.search(clean_cell_text(c)) for row in rows for c in row if c):
         return False
     return count_amount_rows(rows) >= min_amount_rows
 
@@ -193,6 +312,18 @@ def split_header_rows(
     return header_rows, body
 
 
+def _drop_empty_columns(rows: List[List[str]]) -> List[List[str]]:
+    """Removes layout spacer columns that hold no value in any row."""
+    width = max((len(r) for r in rows), default=0)
+    if width < 2:
+        return rows
+    padded = [r + [""] * (width - len(r)) for r in rows]
+    keep = [i for i in range(width) if any(r[i] for r in padded)]
+    if not keep or len(keep) == width:
+        return rows
+    return [[r[i] for i in keep] for r in padded]
+
+
 def table_block_from_grid(
     grid: List[List[str]],
     caption: str = "",
@@ -200,12 +331,20 @@ def table_block_from_grid(
     section: str = "",
     page_start: Optional[int] = None,
     page_end: Optional[int] = None,
+    header_hint: Optional[List[str]] = None,
 ) -> Optional[TableBlock]:
-    """Builds a TableBlock from a raw grid of cell strings."""
+    """Builds a TableBlock from a raw grid of cell strings.
+
+    ``header_hint`` is the layout engine's own header reading (PyMuPDF
+    ``table.header.names``). It is only used when the grid itself yields no
+    usable column words, because those grids are the ones that end up as
+    Col_1..Col_N.
+    """
     rows = [[clean_cell_text(cell) for cell in row] for row in (grid or [])]
     rows = [row for row in rows if any(cell for cell in row)]
     if not rows:
         return None
+    rows = _drop_empty_columns(rows)
 
     header_rows, body = split_header_rows(rows)
     if not body:
@@ -215,8 +354,24 @@ def table_block_from_grid(
     width = max([len(headers)] + [len(row) for row in body])
     if width == 0:
         return None
+
+    hint = _expand_header_hint(header_hint, width)
+    if hint and (not headers or _headers_are_placeholders(headers)):
+        headers = _combine_header_tiers(hint, headers)
+    if headers:
+        headers[0] = _repair_first_label(headers[0], caption)
+
     if len(headers) < width:
-        headers = headers + [f"Col_{i + 1}" for i in range(len(headers), width)]
+        # A header row shorter than the data means its last label spans the
+        # remaining value columns (the "$" / amount split).
+        tail = next((h for h in reversed(headers) if h), "")
+        headers = headers + [
+            tail if tail else f"Col_{i + 1}" for i in range(len(headers), width)
+        ]
+
+    # An unlabelled leftmost column that holds row labels is "Particulars".
+    if headers and headers[0].lower().startswith("col_") and _first_column_is_text(body):
+        headers[0] = "Particulars"
 
     if not unit_context:
         for row in (header_rows[:2] + body[:2]):
@@ -237,6 +392,19 @@ def table_block_from_grid(
     )
 
 
+def _fill_header_spans(cells: List[str]) -> List[str]:
+    """Carries a header label rightwards across the blank cells it spans."""
+    filled: List[str] = []
+    current = ""
+    for cell in cells:
+        if cell:
+            current = cell
+            filled.append(cell)
+        else:
+            filled.append(current)
+    return filled
+
+
 def flatten_multitier_headers(header_rows: List[List[str]]) -> List[str]:
     """
     Combines multi-tier header rows into single, descriptive column labels.
@@ -250,28 +418,20 @@ def flatten_multitier_headers(header_rows: List[List[str]]) -> List[str]:
     if not header_rows:
         return []
     if len(header_rows) == 1:
-        return [clean_cell_text(c) or f"Col_{i+1}" for i, c in enumerate(header_rows[0])]
+        cells = _fill_header_spans([clean_cell_text(c) for c in header_rows[0]])
+        return [c or f"Col_{i+1}" for i, c in enumerate(cells)]
 
     # Determine max columns
     max_cols = max(len(r) for r in header_rows)
 
-    # Normalize matrix to max_cols
+    # Normalize matrix to max_cols, carrying each tier's labels across the
+    # blank cells of the merged header groups they span.
     grid: List[List[str]] = []
     for r in header_rows:
-        cells = [clean_cell_text(c) for c in r]
+        cells = _fill_header_spans([clean_cell_text(c) for c in r])
         if len(cells) < max_cols:
             cells.extend([""] * (max_cols - len(cells)))
         grid.append(cells)
-
-    # Forward fill parent rows if spanning across sub-columns
-    for row_idx in range(len(grid) - 1):
-        last_val = ""
-        for col_idx in range(max_cols):
-            val = grid[row_idx][col_idx]
-            if val:
-                last_val = val
-            elif last_val and (col_idx + 1 < max_cols and grid[row_idx][col_idx + 1] == ""):
-                grid[row_idx][col_idx] = last_val
 
     # Combine downward
     final_headers: List[str] = []
