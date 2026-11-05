@@ -425,7 +425,7 @@ def judge_answer(groq_client: Groq, question: str, answer: str, sources: list) -
         context_text = "[No retrieved context available]"
     answer = _clip_for_judge(answer, JUDGE_ANSWER_CHARS)
 
-    model = os.getenv("EVAL_JUDGE_MODEL", "openai/gpt-oss-20b")
+    model = os.getenv("EVAL_JUDGE_MODEL", "qwen/qwen3.8-27b")
     for attempt in range(3):
         try:
             time.sleep(1.0)
