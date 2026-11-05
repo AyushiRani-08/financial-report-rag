@@ -426,19 +426,21 @@ def judge_answer(groq_client: Groq, question: str, answer: str, sources: list) -
     answer = _clip_for_judge(answer, JUDGE_ANSWER_CHARS)
 
     model = os.getenv("EVAL_JUDGE_MODEL", "qwen/qwen3.8-27b")
+    # gpt-oss spends completion tokens on hidden reasoning and needs headroom;
+    # qwen does not, and Groq enforces a 1000 OTPM cap that larger requests trip.
+    is_reasoning = "gpt-oss" in model
+    kwargs = {"reasoning_effort": "low"} if is_reasoning else {}
+    max_tokens = 1200 if is_reasoning else 800
     for attempt in range(3):
         try:
             time.sleep(1.0)
-            kwargs = {"reasoning_effort": "low"} if "gpt-oss" in model else {}
             response = groq_client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": JUDGE_PROMPT.format(
                     question=question, context=context_text, answer=answer
                 )}],
                 temperature=0.0,
-                # gpt-oss spends completion tokens on hidden reasoning; 300
-                # left none for the JSON body.
-                max_tokens=1200,
+                max_tokens=max_tokens,
                 **kwargs,
             )
             raw = (response.choices[0].message.content or "").strip()

@@ -207,15 +207,18 @@ def judge_groundedness(
     )
 
     model = os.getenv("EVAL_JUDGE_MODEL", "qwen/qwen3.8-27b")
+    # gpt-oss needs reasoning headroom; qwen must stay under Groq's 1000 OTPM cap.
+    is_reasoning = "gpt-oss" in model
+    kwargs = {"reasoning_effort": "low"} if is_reasoning else {}
+    max_tokens = 1200 if is_reasoning else 800
     for attempt in range(3):
         try:
             time.sleep(1.0)
-            kwargs = {"reasoning_effort": "low"} if "gpt-oss" in model else {}
             resp = groq_client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
-                max_tokens=1200,
+                max_tokens=max_tokens,
                 **kwargs,
             )
             raw = (resp.choices[0].message.content or "").strip()
