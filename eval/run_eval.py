@@ -412,7 +412,8 @@ def _clip_for_judge(text: str, limit: int) -> str:
     return f"{text[:head]}\n[...trimmed...]\n{text[-tail:]}"
 
 
-def judge_answer(groq_client: Groq, question: str, answer: str, sources: list) -> dict:
+def judge_answer(groq_client: Groq, question: str, answer: str, sources: list,
+                 verified_facts: str = "") -> dict:
     """Use Groq LLM to judge answer faithfulness, relevance, and clarity."""
     selected = sources[:4]
     per_source = JUDGE_CONTEXT_CHARS // max(1, len(selected))
@@ -423,6 +424,13 @@ def judge_answer(groq_client: Groq, question: str, answer: str, sources: list) -
     ])
     if not context_text:
         context_text = "[No retrieved context available]"
+    # Numbers the generator cites from the XBRL database are not visible in the
+    # Chroma chunks, so the judge would flag accurate figures as hallucinations.
+    if verified_facts.strip():
+        context_text += (
+            "\n---\n[Verified XBRL facts from the filings database — ground truth, "
+            "never a hallucination]\n" + _clip_for_judge(verified_facts, 1200)
+        )
     answer = _clip_for_judge(answer, JUDGE_ANSWER_CHARS)
 
     model = os.getenv("EVAL_JUDGE_MODEL", "qwen/qwen3.8-27b")
@@ -491,7 +499,8 @@ def run_qualitative_eval(generator: RAGGenerator, vector_store: VectorStore,
             answer    = response.get("answer", "")
             sources   = response.get("sources", [])
             latency_ms = round((time.perf_counter() - t_start) * 1000)
-            scores    = judge_answer(groq_client, question, answer, sources)
+            scores    = judge_answer(groq_client, question, answer, sources,
+                                     response.get("xbrl_context", ""))
             empty     = not (answer or "").strip()
             graded    = not scores.get("judge_used_fallback", False) and not empty
 

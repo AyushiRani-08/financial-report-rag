@@ -654,7 +654,8 @@ ANALYST RESPONSE:"""
         model_name=self.model_name, answer_length=len(clean_answer),
     )
 
-    return {"answer": clean_answer, "sources": chunks, "chart_data": chart_data}
+    return {"answer": clean_answer, "sources": chunks, "chart_data": chart_data,
+            "xbrl_context": xbrl_block}
 
   def generate_answer_stream(
       self,
