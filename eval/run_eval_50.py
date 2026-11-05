@@ -179,31 +179,46 @@ def check_abstention(answer: str) -> bool:
 # LLM-AS-JUDGE (Groundedness)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _clip_for_judge(text: str, limit: int) -> str:
+    """Head + tail clip; table totals often sit at the end of a chunk."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    head = int(limit * 0.7)
+    tail = limit - head
+    return f"{text[:head]}\n[...trimmed...]\n{text[-tail:]}"
+
+
 def judge_groundedness(
     groq_client: Groq, question: str, answer: str,
     sources: List[Dict], abstention_expected: bool
 ) -> Dict:
     """Use Groq as a judge to score groundedness, faithfulness and relevance."""
+    selected = sources[:5]
     context_text = "\n---\n".join([
         f"[Source {i+1} | Page {s.get('metadata', {}).get('page_number', '?')}]\n"
-        f"{s.get('text', '')[:500]}"
-        for i, s in enumerate(sources[:5])
+        f"{_clip_for_judge(s.get('text', ''), 1000)}"
+        for i, s in enumerate(selected)
     ]) or "[No retrieved context available]"
 
     prompt = GROUNDEDNESS_JUDGE_PROMPT.format(
-        question=question, context=context_text, answer=answer
+        question=question, context=context_text,
+        answer=_clip_for_judge(answer, 3000),
     )
 
+    model = os.getenv("EVAL_JUDGE_MODEL", "openai/gpt-oss-20b")
     for attempt in range(3):
         try:
             time.sleep(1.0)
+            kwargs = {"reasoning_effort": "low"} if "gpt-oss" in model else {}
             resp = groq_client.chat.completions.create(
-                model=os.getenv("EVAL_JUDGE_MODEL", "openai/gpt-oss-20b"),
+                model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
-                max_tokens=350,
+                max_tokens=1200,
+                **kwargs,
             )
-            raw = resp.choices[0].message.content.strip()
+            raw = (resp.choices[0].message.content or "").strip()
             # Strip possible markdown fences
             raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.IGNORECASE)
             raw = re.sub(r"```$", "", raw)

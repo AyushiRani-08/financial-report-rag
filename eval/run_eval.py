@@ -395,35 +395,63 @@ def generate_qualitative_questions(groq_client: Groq, vector_store: VectorStore,
     return questions
 
 
+# Groq's on-demand tier caps at 8k tokens/minute. A judge prompt built from
+# four full chunks (up to ~10k tokens) can never fit, so every call 429s.
+# Budget characters instead of tokens (~4 chars/token).
+JUDGE_CONTEXT_CHARS = 5000
+JUDGE_ANSWER_CHARS = 3000
+
+
+def _clip_for_judge(text: str, limit: int) -> str:
+    """Head + tail clip; table totals often sit at the end of a chunk."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    head = int(limit * 0.7)
+    tail = limit - head
+    return f"{text[:head]}\n[...trimmed...]\n{text[-tail:]}"
+
+
 def judge_answer(groq_client: Groq, question: str, answer: str, sources: list) -> dict:
     """Use Groq LLM to judge answer faithfulness, relevance, and clarity."""
+    selected = sources[:4]
+    per_source = JUDGE_CONTEXT_CHARS // max(1, len(selected))
     context_text = "\n---\n".join([
-        f"[Source {i+1} | Page {s.get('metadata', {}).get('page_number', '?')}]\n{s.get('text', '')}"
-        for i, s in enumerate(sources[:4])
+        f"[Source {i+1} | Page {s.get('metadata', {}).get('page_number', '?')}]\n"
+        f"{_clip_for_judge(s.get('text', ''), per_source)}"
+        for i, s in enumerate(selected)
     ])
     if not context_text:
         context_text = "[No retrieved context available]"
+    answer = _clip_for_judge(answer, JUDGE_ANSWER_CHARS)
 
+    model = os.getenv("EVAL_JUDGE_MODEL", "openai/gpt-oss-20b")
     for attempt in range(3):
         try:
             time.sleep(1.0)
+            kwargs = {"reasoning_effort": "low"} if "gpt-oss" in model else {}
             response = groq_client.chat.completions.create(
-                model="openai/gpt-oss-20b",
+                model=model,
                 messages=[{"role": "user", "content": JUDGE_PROMPT.format(
                     question=question, context=context_text, answer=answer
                 )}],
                 temperature=0.0,
-                max_tokens=300,
+                # gpt-oss spends completion tokens on hidden reasoning; 300
+                # left none for the JSON body.
+                max_tokens=1200,
+                **kwargs,
             )
-            raw = response.choices[0].message.content.strip()
+            raw = (response.choices[0].message.content or "").strip()
             match = re.search(r'\{.*?\}', raw, re.DOTALL)
             if match:
                 scores = json.loads(match.group(0))
                 scores.setdefault("judge_used_fallback", False)
                 return scores
-        except Exception:
+        except Exception as exc:
             if attempt < 2:
                 time.sleep(3.0 * (attempt + 1))
+            else:
+                print(f"      [JUDGE WARN] {exc}")
     return {"faithfulness": None, "relevance": None, "retail_clarity": None,
             "has_hallucination": None, "reasoning": "Judge unavailable — ungraded",
             "judge_used_fallback": True}
@@ -527,7 +555,7 @@ def print_summary(all_results: list[dict], save_path: Path):
         avg_lat = [r["latency_ms"] for r in graded_q if r.get("latency_ms")]
         attr_checked = sum(1 for r in graded_q if r.get("attribution_checked"))
         print(f"\n  Quantitative ({len(graded_q)} graded / {len(quant)} cases)")
-        print(f"    Pass Rate:        {q_pass}%  (attributed checker)")
+        print(f"    Pass Rate:        {f'{q_pass}%' if graded_q else 'n/a (no graded cases)'}  (attributed checker)")
         print(f"    Errors:           {q_errors} (ungraded)")
         print(f"    Avg Num Error:    {avg_err_str}")
         print(f"    Avg Latency:      {round(sum(avg_lat)/len(avg_lat))}ms" if avg_lat else "")
@@ -545,7 +573,7 @@ def print_summary(all_results: list[dict], save_path: Path):
         rel_scores   = [r["relevance"] for r in graded if r.get("relevance") is not None]
         halluc_rate  = sum(1 for r in graded if r.get("has_hallucination") is True)
         print(f"\n  Qualitative ({len(graded)} graded / {len(qual)} cases)")
-        print(f"    Pass Rate:        {pct(graded)}%")
+        print(f"    Pass Rate:        {f'{pct(graded)}%' if graded else 'n/a (no graded cases)'}")
         print(f"    Avg Faithfulness: {sum(faith_scores)/len(faith_scores):.2f}/5" if faith_scores else "")
         print(f"    Avg Relevance:    {sum(rel_scores)/len(rel_scores):.2f}/5" if rel_scores else "")
         print(f"    Hallucinations:   {halluc_rate}/{len(graded)}")
