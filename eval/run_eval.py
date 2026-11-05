@@ -364,7 +364,7 @@ def generate_qualitative_questions(groq_client: Groq, vector_store: VectorStore,
             try:
                 time.sleep(1.0)
                 response = groq_client.chat.completions.create(
-                    model="openai/gpt-oss-20b",
+                    model=os.getenv("EVAL_QUESTION_MODEL", "qwen/qwen3.8-27b"),
                     messages=[{"role": "user", "content": QUESTION_GEN_PROMPT.format(
                         paper_id=paper_id, chunk_text=sample_text
                     )}],
