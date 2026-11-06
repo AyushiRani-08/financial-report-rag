@@ -16,7 +16,14 @@ from utils.metadata_parser import COMPANY_TICKER_MAP, parse_filing_metadata
 from privacy import redact_query, get_redaction_summary, get_engine_status
 from auth.session import require_auth, logout, get_current_user, render_sidebar_user
 from visualization import render_chart
-from ui import apply_theme, render_settings_section, render_scope_bar
+from ui import (
+    apply_theme,
+    render_settings_section,
+    render_scope_bar,
+    render_citation_pills,
+    render_source_viewer,
+    viewer_is_open,
+)
 
 load_dotenv()
 
@@ -77,7 +84,10 @@ def _source_label(meta: dict) -> str:
     return " | ".join(bits) or "Section not available"
 
 
-def _render_sources(sources: list) -> None:
+def _render_sources(sources: list, key_prefix: str = "sources") -> None:
+    if not sources:
+        return
+    render_citation_pills(sources, key_prefix)
     with st.expander(f"Retrieved Source References ({len(sources)})"):
         for i, src in enumerate(sources, start=1):
             meta = src.get("metadata", {})
@@ -409,182 +419,215 @@ render_scope_bar(scope_text, grounding_info)
 
 
 # ─────────────────────────────────────────────
-# CHAT STATE AND STARTER QUERIES
+# CHAT SESSION
 # ─────────────────────────────────────────────
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+def _render_chat_session(
+    rag_generator,
+    vector_store,
+    top_k: int,
+    selected_doc: str,
+    is_global: bool,
+    target_paper,
+    xbrl_ticker,
+    xbrl_period,
+    generate_report_btn: bool,
+) -> None:
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-query_to_execute = None
+    query_to_execute = None
 
-if not st.session_state.messages:
-    st.caption("Select a filing or prompt to begin analysis:")
-    col_q1, col_q2 = st.columns(2)
-    with col_q1:
-        if st.button("Analyze revenue growth & operating margin trajectory", use_container_width=True, key="sq1", type="secondary"):
-            query_to_execute = "Analyze revenue growth and operating margin trajectory over the reported periods."
-        if st.button("Summarize principal risk factors & legal disclosures", use_container_width=True, key="sq2", type="secondary"):
-            query_to_execute = "Summarize the principal risk factors and material legal disclosures."
-    with col_q2:
-        if st.button("Evaluate liquidity, debt maturity & operating cash flow", use_container_width=True, key="sq3", type="secondary"):
-            query_to_execute = "Evaluate liquidity, debt maturity profile, and operating cash flow."
-        if st.button("Report earnings per share (EPS) & capex details", use_container_width=True, key="sq4", type="secondary"):
-            query_to_execute = "Report basic and diluted earnings per share (EPS) and capital expenditure details."
+    if not st.session_state.messages:
+        st.caption("Select a filing or prompt to begin analysis:")
+        col_q1, col_q2 = st.columns(2)
+        with col_q1:
+            if st.button("Analyze revenue growth & operating margin trajectory", use_container_width=True, key="sq1", type="secondary"):
+                query_to_execute = "Analyze revenue growth and operating margin trajectory over the reported periods."
+            if st.button("Summarize principal risk factors & legal disclosures", use_container_width=True, key="sq2", type="secondary"):
+                query_to_execute = "Summarize the principal risk factors and material legal disclosures."
+        with col_q2:
+            if st.button("Evaluate liquidity, debt maturity & operating cash flow", use_container_width=True, key="sq3", type="secondary"):
+                query_to_execute = "Evaluate liquidity, debt maturity profile, and operating cash flow."
+            if st.button("Report earnings per share (EPS) & capex details", use_container_width=True, key="sq4", type="secondary"):
+                query_to_execute = "Report basic and diluted earnings per share (EPS) and capital expenditure details."
 
+    # ── Render Chat History ──
+    for idx, msg in enumerate(st.session_state.messages):
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if msg.get("chart_data"):
+                render_chart(msg["chart_data"])
+            if msg.get("sources"):
+                _render_sources(msg["sources"], key_prefix=f"msg{idx}")
 
-# ── Render Chat History ──
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        if msg.get("chart_data"):
-            render_chart(msg["chart_data"])
-        if "sources" in msg and msg["sources"]:
-            _render_sources(msg["sources"])
+    # ─────────────────────────────────────────
+    # EXECUTION: STANDARD REPORT (streamed)
+    # ─────────────────────────────────────────
+    if generate_report_btn:
+        doc_target_label = selected_doc if not is_global else "all indexed filings"
+        user_prompt_text = f"Generate standard financial analysis report for {doc_target_label}."
 
+        st.session_state.messages.append({"role": "user", "content": user_prompt_text})
+        with st.chat_message("user"):
+            st.markdown(user_prompt_text)
 
-# ─────────────────────────────────────────────
-# EXECUTION: STANDARD REPORT (streamed)
-# ─────────────────────────────────────────────
-if generate_report_btn:
-    doc_target_label = selected_doc if not is_global else "all indexed filings"
-    user_prompt_text = f"Generate standard financial analysis report for {doc_target_label}."
-
-    st.session_state.messages.append({"role": "user", "content": user_prompt_text})
-    with st.chat_message("user"):
-        st.markdown(user_prompt_text)
-
-    with st.chat_message("assistant"):
-        report_sources = []
-        report_charts = []
-        report_answer = st.write_stream(
-            rag_generator.generate_standard_report_stream(
-                paper_id=target_paper,
-                ticker=xbrl_ticker,
-                fiscal_period=xbrl_period,
-                sources_out=report_sources,
-                chart_out=report_charts,
-            )
-        )
-
-        answer_ok = bool(report_answer) and bool(str(report_answer).strip())
-        if not answer_ok:
-            st.error("The model returned an empty response — please retry.")
-        else:
-            if report_charts:
-                render_chart(report_charts[0])
-
-            safe_label = doc_target_label.replace(" ", "_").replace("/", "-")
-            st.download_button(
-                label="Export Report (.md)",
-                data=report_answer,
-                file_name=f"FinSight_Report_{safe_label}.md",
-                mime="text/markdown",
-                key="btn_export_report",
+        with st.chat_message("assistant"):
+            report_sources = []
+            report_charts = []
+            report_answer = st.write_stream(
+                rag_generator.generate_standard_report_stream(
+                    paper_id=target_paper,
+                    ticker=xbrl_ticker,
+                    fiscal_period=xbrl_period,
+                    sources_out=report_sources,
+                    chart_out=report_charts,
+                )
             )
 
-            if report_sources:
-                _render_sources(report_sources)
+            answer_ok = bool(report_answer) and bool(str(report_answer).strip())
+            if not answer_ok:
+                st.error("The model returned an empty response — please retry.")
+            else:
+                if report_charts:
+                    render_chart(report_charts[0])
 
-    if answer_ok:
+                safe_label = doc_target_label.replace(" ", "_").replace("/", "-")
+                st.download_button(
+                    label="Export Report (.md)",
+                    data=report_answer,
+                    file_name=f"FinSight_Report_{safe_label}.md",
+                    mime="text/markdown",
+                    key="btn_export_report",
+                )
+
+                if report_sources:
+                    _render_sources(report_sources, key_prefix="report")
+
+        if answer_ok:
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": report_answer,
+                "chart_data": report_charts[0] if report_charts else None,
+                "sources": report_sources,
+            })
+
+    # ─────────────────────────────────────────
+    # INLINE ATTACHMENT AND INPUT HANDLING
+    # ─────────────────────────────────────────
+    active_attached_doc = st.session_state.get("attached_doc")
+
+    col_attach, col_status = st.columns([1.5, 3.5])
+    with col_attach:
+        with st.popover("Attach Document", use_container_width=True):
+            st.caption("Upload a financial report for session-level analysis.")
+            session_upload = st.file_uploader(
+                "Upload Filing",
+                type=["pdf", "html", "htm", "json", "csv", "txt"],
+                key="session_uploader",
+                label_visibility="collapsed",
+            )
+            if session_upload:
+                # Validate file
+                validation_error = _validate_uploaded_file(session_upload)
+                if validation_error:
+                    st.error(validation_error)
+                else:
+                    raw_dir = Path(__file__).resolve().parent / "data" / "raw_pdfs"
+                    raw_dir.mkdir(parents=True, exist_ok=True)
+                    clean_name = _sanitize_filename(session_upload.name)
+                    save_path = raw_dir / clean_name
+                    with open(save_path, "wb") as f:
+                        f.write(session_upload.getbuffer())
+
+                    if st.button("Index and Attach", use_container_width=True, key="btn_session_index"):
+                        with st.spinner(f"Indexing {clean_name}..."):
+                            try:
+                                c_count = vector_store.add_document(str(save_path))
+                                st.cache_data.clear()
+                                st.cache_resource.clear()
+                                doc_stem = Path(clean_name).stem
+                                st.session_state["attached_doc"] = doc_stem
+                                auto_t, auto_p = _parse_ticker_and_period(doc_stem)
+                                if auto_t:
+                                    st.session_state["auto_ticker"] = auto_t
+                                st.success(f"Attached {clean_name} ({c_count} chunks indexed).")
+                                st.rerun()
+                            except Exception as e:
+                                _log_upload_error(e, clean_name)
+                                st.error(_user_friendly_error(e))
+
+    with col_status:
+        if active_attached_doc:
+            st.caption(f"Active session attachment: **{active_attached_doc}**")
+
+    effective_paper_id = active_attached_doc or target_paper
+
+    chat_prompt = st.chat_input("Enter your financial inquiry regarding this filing...")
+    final_prompt = query_to_execute or chat_prompt
+
+    # ─────────────────────────────────────────
+    # CHAT RESPONSE (streamed word-by-word)
+    # ─────────────────────────────────────────
+    if final_prompt:
+        clean_prompt, pii_findings = redact_query(final_prompt)
+        privacy_badge = get_redaction_summary(pii_findings)
+
+        st.session_state.messages.append({"role": "user", "content": final_prompt})
+        with st.chat_message("user"):
+            st.markdown(final_prompt)
+            if privacy_badge:
+                st.caption(privacy_badge)
+
+        with st.chat_message("assistant"):
+            chat_sources = []
+            chat_charts = []
+            answer = st.write_stream(
+                rag_generator.generate_answer_stream(
+                    query=clean_prompt,
+                    top_k=top_k,
+                    paper_id=effective_paper_id,
+                    ticker=xbrl_ticker,
+                    fiscal_period=xbrl_period,
+                    sources_out=chat_sources,
+                    chart_out=chat_charts,
+                )
+            )
+
+            if chat_charts:
+                render_chart(chat_charts[0])
+
+            if chat_sources:
+                _render_sources(chat_sources, key_prefix="chat")
+
         st.session_state.messages.append({
             "role": "assistant",
-            "content": report_answer,
-            "chart_data": report_charts[0] if report_charts else None,
-            "sources": report_sources,
+            "content": answer,
+            "chart_data": chat_charts[0] if chat_charts else None,
+            "sources": chat_sources,
         })
 
 
 # ─────────────────────────────────────────────
-# INLINE ATTACHMENT AND INPUT HANDLING
+# LAYOUT: chat, plus filing panel when a citation is open
 # ─────────────────────────────────────────────
-active_attached_doc = st.session_state.get("attached_doc")
+if viewer_is_open():
+    chat_column, viewer_column = st.columns([1.15, 0.85], gap="large")
+else:
+    chat_column, viewer_column = st.container(), None
 
-col_attach, col_status = st.columns([1.5, 3.5])
-with col_attach:
-    with st.popover("Attach Document", use_container_width=True):
-        st.caption("Upload a financial report for session-level analysis.")
-        session_upload = st.file_uploader(
-            "Upload Filing",
-            type=["pdf", "html", "htm", "json", "csv", "txt"],
-            key="session_uploader",
-            label_visibility="collapsed",
-        )
-        if session_upload:
-            # Validate file
-            validation_error = _validate_uploaded_file(session_upload)
-            if validation_error:
-                st.error(validation_error)
-            else:
-                raw_dir = Path(__file__).resolve().parent / "data" / "raw_pdfs"
-                raw_dir.mkdir(parents=True, exist_ok=True)
-                clean_name = _sanitize_filename(session_upload.name)
-                save_path = raw_dir / clean_name
-                with open(save_path, "wb") as f:
-                    f.write(session_upload.getbuffer())
+with chat_column:
+    _render_chat_session(
+        rag_generator=rag_generator,
+        vector_store=vector_store,
+        top_k=top_k,
+        selected_doc=selected_doc,
+        is_global=is_global,
+        target_paper=target_paper,
+        xbrl_ticker=xbrl_ticker,
+        xbrl_period=xbrl_period,
+        generate_report_btn=generate_report_btn,
+    )
 
-                if st.button("Index and Attach", use_container_width=True, key="btn_session_index"):
-                    with st.spinner(f"Indexing {clean_name}..."):
-                        try:
-                            c_count = vector_store.add_document(str(save_path))
-                            st.cache_data.clear()
-                            st.cache_resource.clear()
-                            doc_stem = Path(clean_name).stem
-                            st.session_state["attached_doc"] = doc_stem
-                            auto_t, auto_p = _parse_ticker_and_period(doc_stem)
-                            if auto_t:
-                                st.session_state["auto_ticker"] = auto_t
-                            st.success(f"Attached {clean_name} ({c_count} chunks indexed).")
-                            st.rerun()
-                        except Exception as e:
-                            _log_upload_error(e, clean_name)
-                            st.error(_user_friendly_error(e))
-
-with col_status:
-    if active_attached_doc:
-        st.caption(f"Active session attachment: **{active_attached_doc}**")
-
-effective_paper_id = active_attached_doc or target_paper
-
-chat_prompt = st.chat_input("Enter your financial inquiry regarding this filing...")
-final_prompt = query_to_execute or chat_prompt
-
-
-# ─────────────────────────────────────────────
-# CHAT RESPONSE (streamed word-by-word)
-# ─────────────────────────────────────────────
-if final_prompt:
-    clean_prompt, pii_findings = redact_query(final_prompt)
-    privacy_badge = get_redaction_summary(pii_findings)
-
-    st.session_state.messages.append({"role": "user", "content": final_prompt})
-    with st.chat_message("user"):
-        st.markdown(final_prompt)
-        if privacy_badge:
-            st.caption(privacy_badge)
-
-    with st.chat_message("assistant"):
-        chat_sources = []
-        chat_charts = []
-        answer = st.write_stream(
-            rag_generator.generate_answer_stream(
-                query=clean_prompt,
-                top_k=top_k,
-                paper_id=effective_paper_id,
-                ticker=xbrl_ticker,
-                fiscal_period=xbrl_period,
-                sources_out=chat_sources,
-                chart_out=chat_charts,
-            )
-        )
-
-        if chat_charts:
-            render_chart(chat_charts[0])
-
-        if chat_sources:
-            _render_sources(chat_sources)
-
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": answer,
-        "chart_data": chat_charts[0] if chat_charts else None,
-        "sources": chat_sources,
-    })
+if viewer_column is not None:
+    with viewer_column:
+        render_source_viewer()
