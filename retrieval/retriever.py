@@ -61,14 +61,19 @@ class Retriever:
         # 1. Embed query
         query_vector = self.embedder.embed_query(query).tolist()
 
-        # Candidate pool: fetch more candidates so re-ranker has high-quality selection
-        candidate_k = max(top_k * 4, 15)
+        # Candidate pool: fetch more candidates so re-ranker has high-quality selection.
+        # 50+ gives low-signal but correct chunks (infographic stats, short table rows)
+        # a chance to reach the cross-encoder even when vector rank is mediocre.
+        candidate_k = max(top_k * 10, 50)
 
+        # A specific document already scopes the search to one filing. A ticker
+        # from stale session state or inferred from an earlier question must not
+        # zero out that document's chunks (uploaded PDFs often have no ticker).
         scope_args = dict(
             query_vector=query_vector,
             paper_id=paper_id,
-            ticker=ticker,
-            fiscal_period=fiscal_period,
+            ticker=None if paper_id else ticker,
+            fiscal_period=None if paper_id else fiscal_period,
             statement_scope=statement_scope,
         )
 

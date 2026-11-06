@@ -545,7 +545,12 @@ class RAGGenerator:
     )
 
     # --- Layer 1: Pre-Retrieval Abstention Gate ---
-    abstention = check_pre_retrieval_abstention(query, ticker=active_ticker, fiscal_period=active_period)
+    # An attached document scopes the search; its coverage is not limited to the
+    # XBRL facts horizon, so the future-period rule must not fire against it.
+    abstention = check_pre_retrieval_abstention(
+        query, ticker=active_ticker, fiscal_period=active_period,
+        has_attached_document=bool(paper_id),
+    )
     if abstention:
         log_query(
             query=query, query_type="qa_abstain", paper_id=paper_id, top_k=0,
@@ -678,7 +683,11 @@ ANALYST RESPONSE:"""
       )
 
       # Layer 1: Pre-Retrieval Abstention Gate
-      abstention = check_pre_retrieval_abstention(query, ticker=active_ticker, fiscal_period=active_period)
+      # See generate_answer: attached documents are exempt from the future-period rule.
+      abstention = check_pre_retrieval_abstention(
+          query, ticker=active_ticker, fiscal_period=active_period,
+          has_attached_document=bool(paper_id),
+      )
       if abstention:
           if sources_out is not None:
               sources_out.clear()

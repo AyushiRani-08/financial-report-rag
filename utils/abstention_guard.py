@@ -113,6 +113,7 @@ def check_pre_retrieval_abstention(
     ticker: Optional[str] = None,
     fiscal_period: Optional[str] = None,
     latest_filed_end: Optional[date] = None,
+    has_attached_document: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     Evaluates whether a query must be refused / abstained from prior to retrieval.
@@ -133,7 +134,12 @@ def check_pre_retrieval_abstention(
                 "reason": rule["message"],
             }
 
-    # Rule B: periods that have not been filed yet — anchored to real data
+    # Rule B: periods that have not been filed yet — anchored to real data.
+    # Skipped when a document is attached: XBRL facts lag uploaded filings, so an
+    # attached 2025 PDF must not be refused on the strength of the facts table alone.
+    if has_attached_document:
+        return None
+
     latest = latest_filed_end if latest_filed_end is not None else _latest_filed_period_end(ticker)
     if latest is not None:
         future_years = sorted({y for y in years_mentioned(q_lower) if y > latest.year})

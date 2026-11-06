@@ -39,11 +39,40 @@ from __future__ import annotations
 import re
 import logging
 import time
+import unicodedata
 from typing import Optional
 
 from .audit import log_redaction
 
 logger = logging.getLogger(__name__)
+
+# Company and brand names that spaCy commonly mis-tags as PERSON ("Nestlé",
+# "Unilever", …). Findings matching this list are dropped so retrieval keeps the
+# real name. Accent-folded and lower-cased before comparison.
+_COMPANY_ALLOWLIST = {
+    # From the project's own ticker map
+    "tesla", "tsla", "microsoft", "msft", "apple", "aapl", "amazon", "amzn",
+    "google", "alphabet", "googl", "meta", "facebook", "nvidia", "nvda",
+    "jpmc", "jpmorgan", "jpm", "boeing", "ba", "berkshire", "brk-b", "asml",
+    "baba", "alibaba",
+    # Common non-US filers and brands financial users ask about
+    "nestle", "nestlé", "unilever", "hsbc", "sap", "siemens", "allianz",
+    "volkswagen", "toyota", "sony", "samsung", "walmart", "costco", "visa",
+    "mastercard", "coca-cola", "pepsico", "procter & gamble", "pg",
+    "l'oreal", "loreal", "nestlé health science", "danone", "lvmh",
+    "airbus", "rolls-royce", "tesco", "carrefour", "aldi", "lidl",
+    "tata", "reliance", "infosys", "tcs", "wipro", "icici", "sbi",
+}
+
+
+def _fold(name: str) -> str:
+    """Lower-case and strip accents so 'Nestlé' matches 'nestle'."""
+    decomposed = unicodedata.normalize("NFKD", name)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower().strip()
+
+
+def _is_known_company(text: str, start: int, end: int) -> bool:
+    return _fold(text[start:end]) in _COMPANY_ALLOWLIST
 
 # ── Entity → placeholder map ──────────────────────────────────────────────────
 _ENTITY_PLACEHOLDERS: dict[str, str] = {
@@ -167,7 +196,20 @@ def redact(text: str, source: str = "unknown") -> tuple[str, list[dict]]:
         try:
             from presidio_anonymizer.entities import OperatorConfig          # type: ignore
 
-            results = _analyzer.analyze(text=working, entities=_PRESIDIO_ENTITIES, language="en")
+            # Document chunks exclude PERSON: filings talk about brands and
+            # products ("Orgain", "Statement from the CEO"), which spaCy tags as
+            # people, and masking them wrecks both embeddings and answers. The
+            # regex layer below still catches true identifiers (emails, phones,
+            # SSNs, cards) in chunk text.
+            entities = (_PRESIDIO_ENTITIES if source == "user_query"
+                        else [e for e in _PRESIDIO_ENTITIES if e != "PERSON"])
+            results = _analyzer.analyze(text=working, entities=entities, language="en")
+            # Drop known company/brand names mis-tagged as PERSON — replacing
+            # "Nestlé" with [PERSON] wrecks semantic retrieval on company data.
+            results = [
+                r for r in (results or [])
+                if r.entity_type != "PERSON" or not _is_known_company(working, r.start, r.end)
+            ]
             if results:
                 operators = {
                     r.entity_type: OperatorConfig(

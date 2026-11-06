@@ -637,6 +637,93 @@ def stitch_tables(tables: List[TableBlock]) -> List[TableBlock]:
     return stitched
 
 
+# Running headers/footers: short lines whose text repeats on many pages
+# (e.g. "Nestlé – Annual Review 2025 5"). Keyed by the text with page numbers
+# stripped, so every page's variant collapses to one key.
+_HEADER_MAX_WORDS = 12
+_HEADER_MIN_PAGES = 3
+_PAGE_NUMBER_ONLY_RE = re.compile(r"^\d{1,4}$")
+_STRIP_EDGE_NUMBERS_RE = re.compile(r"^\d{1,4}[\s.·\-–—]+|[\s.·\-–—]+\d{1,4}$")
+
+
+def _header_key(text: str) -> str:
+    """Normalised form of a short block used to spot repeated headers/footers."""
+    t = _STRIP_EDGE_NUMBERS_RE.sub("", text.casefold())
+    return re.sub(r"\s+", " ", t).strip(" .·-–—")
+
+
+def _drop_boilerplate(blocks: List[Any]) -> List[Any]:
+    """Removes running headers/footers and bare page-number blocks."""
+    occurrences: Dict[str, int] = {}
+    pages: Dict[str, set] = {}
+    for b in blocks:
+        if not isinstance(b, TextBlock):
+            continue
+        text = b.text.strip()
+        if not text or len(text.split()) > _HEADER_MAX_WORDS:
+            continue
+        key = _header_key(text)
+        if not key:
+            continue  # bare page number
+        occurrences[key] = occurrences.get(key, 0) + 1
+        pages.setdefault(key, set()).add(b.page_number)
+
+    def is_boilerplate(b: Any) -> bool:
+        if not isinstance(b, TextBlock):
+            return False
+        text = b.text.strip()
+        if _PAGE_NUMBER_ONLY_RE.fullmatch(text):
+            return True
+        if not text or len(text.split()) > _HEADER_MAX_WORDS:
+            return False
+        key = _header_key(text)
+        distinct_pages = len(pages.get(key, set()))
+        # Blocks without page info (HTML) fall back to raw occurrence count.
+        repeats = distinct_pages if b.page_number is not None else occurrences.get(key, 0)
+        return repeats >= _HEADER_MIN_PAGES
+
+    return [b for b in blocks if not is_boilerplate(b)]
+
+
+def _pack_text_blocks(blocks: List[Any], max_words: int) -> List[Any]:
+    """
+    Merges consecutive TextBlocks up to max_words. PDF reports (especially
+    designed annual reviews) emit tiny text boxes — headings, one stat, a
+    caption — and per-block chunking leaves 3-word fragments that embed
+    poorly. Packing fuses them into meaningful chunks; TableBlocks and
+    section boundaries flush the buffer so structure is preserved.
+    """
+    packed: List[Any] = []
+    buffer: List[TextBlock] = []
+
+    def flush() -> None:
+        if not buffer:
+            return
+        packed.append(TextBlock(
+            text=" ".join(b.text for b in buffer),
+            page_number=buffer[0].page_number,
+            section=buffer[0].section,
+        ))
+        buffer.clear()
+
+    for b in blocks:
+        if not isinstance(b, TextBlock):
+            flush()
+            packed.append(b)
+            continue
+        words = len(b.text.split())
+        buffer_words = sum(len(x.text.split()) for x in buffer)
+        # Page boundary flushes keep chunks page-local so [Page X] citations
+        # stay truthful (PyMuPDF blocks are already per-page; HTML has None).
+        if buffer and (b.page_number != buffer[-1].page_number
+                       or b.section != buffer[0].section
+                       or buffer_words + words > max_words):
+            flush()
+        buffer.append(b)
+    flush()
+    return packed
+
+
 def chunk_document_blocks(
     blocks: List[Any],  # List[TextBlock | TableBlock]
     chunk_size: int = 300,
@@ -647,8 +734,10 @@ def chunk_document_blocks(
     structured list of chunks.
 
     Tables are preserved with table-aware chunking (headers/units replicated).
-    Narrative text is chunked using word overlap.
+    Narrative text is packed into adjacent-block chunks, then word-chunked
+    with overlap.
     """
+    blocks = _pack_text_blocks(_drop_boilerplate(blocks), max_words=chunk_size)
     final_chunks: List[Dict[str, Any]] = []
     global_id = 0
 
